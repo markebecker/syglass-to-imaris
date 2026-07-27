@@ -562,8 +562,10 @@ def _read_mask_from_syk(
         _log(f"[syglass to imaris] .syk: placed {n_placed} level-{max_level} blocks "
               f"(of {n_grid**3} possible)")
 
-        # Full-block placement tiles seamlessly — no seam fill needed (skips the ~20s
-        # whole-volume seam pass).
+        # DIAGNOSTIC: show the value profile across block boundaries so seams / ghost slabs
+        # are directly visible (a gap reads as '11.11', a clean join as '1111').
+        _probe_seams(vol, ux, uy, uz, (bbox_x0, bbox_y0, bbox_z0))
+
         clip_info = (bbox_x0, bbox_y0, bbox_z0, full_nx, full_ny, full_nz)
         return vol, clip_info
 
@@ -620,6 +622,56 @@ def _syk_block_position(block_id: int):
     z_bit = (child_idx >> 2) & 1
     p_lv, p_ix, p_iy, p_iz = _syk_block_position(parent_id)
     return p_lv + 1, 2 * p_ix + x_bit, 2 * p_iy + y_bit, 2 * p_iz + z_bit
+
+
+def _probe_seams(vol, ux, uy, uz, origin, n_probes=4, half=7):
+    """
+    Log the reconstructed value profile across block boundaries, per axis, so seams / ghost
+    slabs are directly visible in the log.  For each of a few boundaries it finds a transverse
+    line where the mask is present and prints ±`half` voxels with '|' marking the boundary:
+      '111|111' clean join · '11.|.11' or '11..11' gap/seam · misaligned = shift/ghost.
+    Dependency-free; reads only a handful of lines.
+    """
+    ox0, oy0, oz0 = origin
+    nx, ny, nz = vol.shape
+
+    def _render(prof, bpos_rel):
+        s = ""
+        for j, v in enumerate(prof):
+            if j == bpos_rel:
+                s += "|"
+            s += "." if v == 0 else (str(v) if v < 10 else "#")
+        return s
+
+    _log("[syglass to imaris] SEAM PROBE (values across block boundaries; | = block edge):")
+    for axis, name, u, o, n in ((0, "X", ux, ox0, nx), (1, "Y", uy, oy0, ny), (2, "Z", uz, oz0, nz)):
+        others = [i for i in range(3) if i != axis]
+        # global block boundaries are at multiples of u; convert to clip coords
+        bnds = [k * u - o for k in range(1, (o + n) // u + 2) if 0 < k * u - o < n]
+        shown = 0
+        for c in bnds:
+            if shown >= n_probes:
+                break
+            lo, hi = max(0, c - half), min(n, c + half + 1)
+            sl = [slice(None)] * 3
+            sl[axis] = slice(lo, hi)
+            band = vol[tuple(sl)]                      # (..slab..) over the two other axes
+            nz2d = np.any(band > 0, axis=axis)
+            hits = np.argwhere(nz2d)
+            if len(hits) == 0:
+                continue
+            a, b = hits[len(hits) // 2]                # a transverse line with mask near the edge
+            idx = [0, 0, 0]
+            idx[others[0]] = int(a)
+            idx[others[1]] = int(b)
+            prof = []
+            for x in range(lo, hi):
+                idx[axis] = x
+                prof.append(int(vol[tuple(idx)]))
+            _log(f"[syglass to imaris]   {name}@{c}: {_render(prof, c - lo)}")
+            shown += 1
+        if shown == 0:
+            _log(f"[syglass to imaris]   {name}: no painted block boundary found")
 
 
 def _diagnose_block_apron(f, block_offset, cx, cy, cz, max_level, block_payload):
