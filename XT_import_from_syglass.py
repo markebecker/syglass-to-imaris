@@ -562,8 +562,13 @@ def _read_mask_from_syk(
         _log(f"[syglass to imaris] .syk: placed {n_placed} level-{max_level} blocks "
               f"(of {n_grid**3} possible)")
 
-        # DIAGNOSTIC: show the value profile across block boundaries so seams / ghost slabs
-        # are directly visible (a gap reads as '11.11', a clean join as '1111').
+        # The X block boundary leaves a 1-voxel gap (seam probe: '111111.|11111111'); Y/Z
+        # tile cleanly.  Fill any 0 voxel flanked by the SAME label on both sides — patches
+        # the seams without inventing data at mask edges (edges have a 0 on one side).
+        vol = _fill_block_seams(vol)
+        _log("[syglass to imaris] .syk: block-boundary seams filled")
+
+        # DIAGNOSTIC (after the fill): the profiles should now read '1111|1111' with no gap.
         _probe_seams(vol, ux, uy, uz, (bbox_x0, bbox_y0, bbox_z0))
 
         clip_info = (bbox_x0, bbox_y0, bbox_z0, full_nx, full_ny, full_nz)
