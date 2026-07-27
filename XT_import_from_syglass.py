@@ -681,17 +681,14 @@ def _probe_seams(vol, ux, uy, uz, origin, n_probes=4, half=7):
 
 def _diagnose_block_apron(f, block_offset, cx, cy, cz, max_level, block_payload):
     """
-    Determine whether adjacent .syk blocks share a ghost/apron slice, by reading one
-    adjacent block pair per axis and comparing boundary slices.
-
-    For each axis it logs how well block A's LAST slice matches block B's FIRST slice
-    (A,B adjacent along that axis), versus a baseline of unrelated interior slices:
-      • high 'A.last==B.first' + low baseline  → high-side apron; blocks OVERLAP by 1
-        (true stride = c-1): the reconstruction must drop A's last slice AND advance by c-1.
-      • high 'A.first==(prev)B.last'           → low-side apron (mirror of the above).
-      • both near baseline                     → blocks ABUT (stride c, keep all slices).
-    Match is computed only over voxels where either slice is painted, so background does
-    not inflate it.  Reads only a few blocks; safe/cheap.
+    Determine the block-overlap structure per axis, AGGREGATED over ALL adjacent painted
+    block pairs (a single pair is too often background).  For pair (A at i, B at i+1) sharing
+    a boundary, it measures painted-voxel agreement of:
+      high = A.last-slice  vs B.first-slice   (high-side apron: A's last duplicates boundary)
+      low  = A.first-slice vs (prev)P.last    (low-side apron:  A's first duplicates boundary)
+      base = A.mid-slice   vs B.mid-slice     (baseline for a smoothly-varying volume)
+    Interpretation: high≫base ⇒ drop A's LAST slice; low≫base ⇒ drop A's FIRST slice;
+    both≈base ⇒ blocks abut, drop nothing.  Reads each block once (cached).
     """
     pos2bid = {}
     for bid in block_offset:
@@ -700,33 +697,38 @@ def _diagnose_block_apron(f, block_offset, cx, cy, cz, max_level, block_payload)
         _lv, ix, iy, iz = _syk_block_position(bid)
         pos2bid[(ix, iy, iz)] = bid
 
+    cache = {}
     def _read(bid):
-        f.seek(block_offset[bid] + 24)
-        return np.frombuffer(f.read(block_payload), dtype="<u2").reshape(cz, cy, cx)  # (z,y,x)
+        if bid not in cache:
+            f.seek(block_offset[bid] + 24)
+            cache[bid] = np.frombuffer(f.read(block_payload), dtype="<u2").reshape(cz, cy, cx)
+        return cache[bid]
 
-    def _match(a, b):
+    def _acc(a, b, tot):
         m = (a > 0) | (b > 0)
-        return float(np.mean(a[m] == b[m])) if m.any() else float("nan")
+        return (tot[0] + int(np.sum(a[m] == b[m])), tot[1] + int(m.sum()))
 
-    _log("[syglass to imaris] APRON DIAGNOSTIC — do adjacent blocks overlap?")
-    # axis in the (z,y,x) reshaped array: X=2, Y=1, Z=0
+    _log("[syglass to imaris] APRON DIAGNOSTIC (aggregated over all adjacent painted pairs):")
     for axis, name, dim in ((2, "X", cx), (1, "Y", cy), (0, "Z", cz)):
-        pair = None
-        for (ix, iy, iz) in pos2bid:
-            nb = {2: (ix + 1, iy, iz), 1: (ix, iy + 1, iz), 0: (ix, iy, iz + 1)}[axis]
+        unit = {2: (1, 0, 0), 1: (0, 1, 0), 0: (0, 0, 1)}[axis]
+        hi = lo = base = (0, 0)
+        npairs = 0
+        for pos, bid in pos2bid.items():
+            nb = tuple(p + u for p, u in zip(pos, unit))
             if nb in pos2bid:
-                pair = ((ix, iy, iz), nb)
-                break
-        if pair is None:
-            _log(f"[syglass to imaris]   {name}: no adjacent block pair present")
-            continue
-        A, B = _read(pos2bid[pair[0]]), _read(pos2bid[pair[1]])
-        a_last  = np.take(A, dim - 1, axis=axis)
-        a_last2 = np.take(A, dim - 2, axis=axis)
-        b_first = np.take(B, 0, axis=axis)
-        base    = _match(np.take(A, dim // 2, axis=axis), np.take(B, dim // 2, axis=axis))
-        _log(f"[syglass to imaris]   {name}: A.last==B.first={_match(a_last, b_first):.2f}  "
-             f"A.last-1==B.first={_match(a_last2, b_first):.2f}  baseline={base:.2f}")
+                A, B = _read(bid), _read(pos2bid[nb])
+                hi   = _acc(np.take(A, dim - 1, axis=axis), np.take(B, 0, axis=axis), hi)
+                base = _acc(np.take(A, dim // 2, axis=axis), np.take(B, dim // 2, axis=axis), base)
+                npairs += 1
+            pb = tuple(p - u for p, u in zip(pos, unit))
+            if pb in pos2bid:
+                A, P = _read(bid), _read(pos2bid[pb])
+                lo = _acc(np.take(A, 0, axis=axis), np.take(P, dim - 1, axis=axis), lo)
+        def _r(t):
+            return (t[0] / t[1]) if t[1] else float("nan")
+        _log(f"[syglass to imaris]   {name}: high(A.last=B.first)={_r(hi):.2f}  "
+             f"low(A.first=prev.last)={_r(lo):.2f}  base={_r(base):.2f}  "
+             f"pairs={npairs} vox={hi[1]}")
 
 
 # -----------------------------------------------------------------------
