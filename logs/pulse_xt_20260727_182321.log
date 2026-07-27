@@ -1,0 +1,97 @@
+18:23:21 [syglass to imaris] logging to: D:\USER DATA\Mark Becker\syglass-imaris-interop\logs\pulse_xt_20260727_182321.log
+18:23:21 [syglass to imaris] no .syk next to the .ims (looked for D:\USER DATA\Mark Becker\v2_nosyk_test\260205_mbls005_dd008v_3a_5b_5ac_af_stc.syk); opening file picker.
+18:23:25 [syglass to imaris] using .syk: D:/USER DATA/Mark Becker/test_masks_2/260205_mbls005_dd008v_3a_5b_5ac_af_stc.syk
+18:23:25 [syglass to imaris] Importing your syglass mask...
+18:23:25 [syglass to imaris] .ims dims:    2167 x 4768 x 1204 voxels
+18:23:25 [syglass to imaris] .ims extents: X=[-1800.750, 8505.910] Y=[-11707.200, 10970.300] Z=[0.000, 6020.000]
+18:23:25 [syglass to imaris] .ims voxel size (um): 4.7562 x 4.7562 x 5.0000
+18:23:25 [syglass to imaris] .syk: cx=136 cy=300 cz=76  stride=6,201,624  ~434 blocks
+18:23:25 [syglass to imaris] .syk: 434 blocks; deepest level=4  full grid=2128×4784×1200
+18:23:25 [syglass to imaris] APRON DIAGNOSTIC (aggregated over all adjacent painted pairs):
+18:23:25 [syglass to imaris]   X: high(A.last=B.first)=0.02  low(A.first=prev.last)=0.02  base=0.03  pairs=229 vox=494900
+18:23:26 [syglass to imaris]   Y: high(A.last=B.first)=0.94  low(A.first=prev.last)=0.94  base=0.02  pairs=155 vox=146234
+18:23:26 [syglass to imaris]   Z: high(A.last=B.first)=0.96  low(A.first=prev.last)=0.96  base=0.14  pairs=256 vox=518874
+18:23:26 [syglass to imaris] .syk: allocating clipped vol 1824×1920×1152 (origin 304,2864,48)
+18:23:28 [syglass to imaris] .syk: placed 317 level-4 blocks (of 4096 possible)
+18:23:51 [syglass to imaris] .syk: block-boundary seams filled
+18:23:51 [syglass to imaris] SEAM PROBE (values across block boundaries; | = block edge):
+18:23:51 [syglass to imaris]   X@95: 1111111|11111111
+18:23:51 [syglass to imaris]   X@228: 1111111|111.....
+18:23:51 [syglass to imaris]   X@361: 1111111|11111111
+18:23:51 [syglass to imaris]   X@494: 1111111|11111111
+18:23:51 [syglass to imaris]   Y@126: 1111111|11111111
+18:23:51 [syglass to imaris]   Y@425: 1111111|11111111
+18:23:51 [syglass to imaris]   Y@724: 1111111|11111111
+18:23:51 [syglass to imaris]   Y@1023: ..11111|11111111
+18:23:51 [syglass to imaris]   Z@27: 1111111|11111111
+18:23:52 [syglass to imaris]   Z@102: 1111111|11111111
+18:23:52 [syglass to imaris]   Z@177: 1111111|11111111
+18:23:52 [syglass to imaris]   Z@252: 1111111|11111111
+18:23:53 [syglass to imaris] mask read in 28.4s
+18:24:03 [syglass to imaris] label_vol shape: (1824, 1920, 1152), dtype: uint16
+18:24:03 [syglass to imaris] Non-zero voxels: 37036963 / 4034396160  (inventory in 9.4s)
+18:24:03 [syglass to imaris]   label 1: 37036963 voxels
+18:24:03 [syglass to imaris] Found 1 labels: [1]
+18:24:04 [syglass to imaris] mask projection — top-down (rows=X, cols=Y):
+18:24:04 [syglass to imaris]   |          ###                                                   |
+18:24:04 [syglass to imaris]   |          ###                                                   |
+18:24:04 [syglass to imaris]   |##    ### #####              ##  ###         ####               |
+18:24:04 [syglass to imaris]   |##   ##########              #######        #####               |
+18:24:04 [syglass to imaris]   |###    ######                #####         ####                 |
+18:24:04 [syglass to imaris]   |############            ###########     ######                  |
+18:24:04 [syglass to imaris]   | ############         ########################                  |
+18:24:04 [syglass to imaris]   | ####    ######       ####   ################                   |
+18:24:04 [syglass to imaris]   |#####                        ##########                         |
+18:24:04 [syglass to imaris]   |######                    #######                               |
+18:24:04 [syglass to imaris]   |########                #######                                 |
+18:24:04 [syglass to imaris]   |   ########         #########                                   |
+18:24:04 [syglass to imaris]   |     #####################                                      |
+18:24:04 [syglass to imaris]   |#########################                                       |
+18:24:04 [syglass to imaris]   |############      ########                                      |
+18:24:04 [syglass to imaris]   |#######              #########                                  |
+18:24:04 [syglass to imaris]   |                    ########################                    |
+18:24:04 [syglass to imaris]   |                #########  #################                    |
+18:24:04 [syglass to imaris]   |                #######       #########                         |
+18:24:04 [syglass to imaris]   |                  ####       ###### ######                      |
+18:24:04 [syglass to imaris]   |                             ###     ##### #                    |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris] mask projection — side (rows=X, cols=Z):
+18:24:04 [syglass to imaris]   |                    ####                                        |
+18:24:04 [syglass to imaris]   |                   #####                                        |
+18:24:04 [syglass to imaris]   |            ####   #####    #######   ###  ###                  |
+18:24:04 [syglass to imaris]   |              #####################   ########                  |
+18:24:04 [syglass to imaris]   |           ######################    #########                  |
+18:24:04 [syglass to imaris]   | ##########################         ######                      |
+18:24:04 [syglass to imaris]   |  #########  #############      ## ########                     |
+18:24:04 [syglass to imaris]   |            ##############   ###############                    |
+18:24:04 [syglass to imaris]   |                   #############################                |
+18:24:04 [syglass to imaris]   |                   ##############################               |
+18:24:04 [syglass to imaris]   |                  ##########      #############                 |
+18:24:04 [syglass to imaris]   |                ###########                                     |
+18:24:04 [syglass to imaris]   |           ###############                                      |
+18:24:04 [syglass to imaris]   |   #########################                                    |
+18:24:04 [syglass to imaris]   |#################### ##########                                 |
+18:24:04 [syglass to imaris]   |################        ##################                      |
+18:24:04 [syglass to imaris]   |                   #######################                      |
+18:24:04 [syglass to imaris]   |                    ###################                         |
+18:24:04 [syglass to imaris]   |                    #####   ############                        |
+18:24:04 [syglass to imaris]   |#######           ######      ###########                       |
+18:24:04 [syglass to imaris]   | ## ###             ###       ######                            |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris]   |                                                                |
+18:24:04 [syglass to imaris] IDataSet (clipped): 1824×1920×1152 voxels  full grid 2128×4784×1200
+18:24:04 [syglass to imaris] IDataSet extents: X=[-328.4, 8505.9] Y=[1869.0, 10970.3] Z=[240.8, 6020.0]
+18:24:04 [syglass to imaris] ims/syk ratio: X=1.02  Y=1.00  Z=1.00
+18:24:04 [syglass to imaris] 1 label(s); each cropped to its bbox, uploaded in <= 900 KB chunks; prep pipelined 1 ahead
+18:24:32 [syglass to imaris] L1/1 (id 1): crop 1404x1448x876 (1780.9 MB) at voxel (43,7,9); painted=37036963 kept=37089117; bbox um X=[-120,6680] Y=[1902,8766] Z=[286,4681]
+18:24:57 [syglass to imaris] L1/1 (id 1): prep_wait=28.09s  upload=20.52s  detect=4.29s  surfaces_in_object=1
+18:24:57 [syglass to imaris] Created 1 surface object(s) in 53.1s  (prep_wait 28.1s + upload 20.5s + detect 4.3s; avg 53.06s/label)
+18:24:57 [syglass to imaris] leveldb not available — cannot read .sym counting points.
+18:24:57 [syglass to imaris] Done — surfaces added to the scene. NOT saved: press Ctrl+S in Imaris to write them to the .ims when ready.
