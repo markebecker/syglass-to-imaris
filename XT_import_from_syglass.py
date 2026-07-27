@@ -71,15 +71,15 @@ _LOG_FH = None
 
 def _setup_logging():
     """
-    Open a timestamped log file in a 'logs' folder that sits parallel to this script's
-    'core' folder — i.e. .../<shuttle>/core/XT_*.py  ->  .../<shuttle>/logs/pulse_xt_*.log.
-    Computed from __file__ at runtime so it follows the folder wherever it is copied.
-    Returns the log path (or None if the file could not be opened).
+    Open a timestamped log file in a 'logs' folder INSIDE the script's own directory —
+    i.e. <script_dir>/logs/pulse_xt_<timestamp>.log.  The script lives at the root of the
+    git repo, so the log lands inside the working tree and can be committed + pushed to
+    share it (the network-drive shuttle is unavailable).  Returns the path, or None on failure.
     """
     global _LOG_FH
     try:
-        core_dir = os.path.dirname(os.path.abspath(__file__))
-        log_dir  = os.path.join(os.path.dirname(core_dir), "logs")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir  = os.path.join(script_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         stamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = os.path.join(log_dir, f"pulse_xt_{stamp}.log")
