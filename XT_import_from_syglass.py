@@ -478,12 +478,12 @@ def _read_mask_from_syk(
 
             max_level = max(_syk_block_level(bid) for bid in block_offset)
             n_grid    = 2 ** max_level
-            # Adjacent blocks SHARE a 1-voxel apron (confirmed by the apron diagnostic:
-            # block A's last slice ≈ block B's first slice).  So each block holds only (c-1)
-            # UNIQUE voxels; the effective stride and full grid use (c-1), and n_grid root
-            # voxels still map to n_grid×(c-1) full voxels (bbox scaling below stays correct).
-            ux, uy, uz = cx - 1, cy - 1, cz - 1
-            full_nx, full_ny, full_nz = n_grid * ux, n_grid * uy, n_grid * uz
+            # Per-axis block geometry (from the aggregated apron diagnostic on real data):
+            #   X abuts — all cx voxels are real, keep them, stride cx.
+            #   Y, Z overlap by a shared apron slice — drop the last slice, stride c-1.
+            # ax/ay/az = unique voxels per block per axis (= placement size = stride).
+            ax, ay, az = cx, cy - 1, cz - 1
+            full_nx, full_ny, full_nz = n_grid * ax, n_grid * ay, n_grid * az
 
             _log(f"[syglass to imaris] .syk: {len(block_offset)} blocks; "
                   f"deepest level={max_level}  full grid={full_nx}×{full_ny}×{full_nz}")
@@ -531,9 +531,9 @@ def _read_mask_from_syk(
                     continue
                 _lv, ix, iy, iz = _syk_block_position(bid)
 
-                bx0, bx1 = ix * ux, ix * ux + ux    # stride (c-1): neighbours share an apron
-                by0, by1 = iy * uy, iy * uy + uy
-                bz0, bz1 = iz * uz, iz * uz + uz
+                bx0, bx1 = ix * ax, ix * ax + ax    # X abuts (stride cx, keep all cx)
+                by0, by1 = iy * ay, iy * ay + ay    # Y apron  (stride cy-1, drop last)
+                bz0, bz1 = iz * az, iz * az + az    # Z apron  (stride cz-1, drop last)
 
                 if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
                 if by1 <= bbox_y0 or by0 >= bbox_y1: continue
@@ -541,16 +541,15 @@ def _read_mask_from_syk(
 
                 f.seek(boff + 24)
                 raw = f.read(block_payload)
-                # Drop the shared apron (last slice on each axis) and place the (c-1) UNIQUE
-                # voxels at stride (c-1).  The neighbour block supplies that boundary slice as
-                # its OWN first slice, so the volume tiles seamlessly — no gaps, no ghost slabs.
+                # Drop the shared apron slice on Y and Z (last y, last z) but keep ALL of X.
+                # reshape is (cz, cy, cx); [:-1, :-1, :] drops last z & last y, keeps every x.
                 arr = (np.frombuffer(raw, dtype="<u2")
-                       .reshape(cz, cy, cx)[:-1, :-1, :-1]
-                       .transpose(2, 1, 0))   # (cx-1, cy-1, cz-1), uint16
+                       .reshape(cz, cy, cx)[:-1, :-1, :]
+                       .transpose(2, 1, 0))   # (cx, cy-1, cz-1), uint16
 
-                sx0 = max(0, bbox_x0 - bx0);  sx1 = min(ux, bbox_x1 - bx0)
-                sy0 = max(0, bbox_y0 - by0);  sy1 = min(uy, bbox_y1 - by0)
-                sz0 = max(0, bbox_z0 - bz0);  sz1 = min(uz, bbox_z1 - bz0)
+                sx0 = max(0, bbox_x0 - bx0);  sx1 = min(ax, bbox_x1 - bx0)
+                sy0 = max(0, bbox_y0 - by0);  sy1 = min(ay, bbox_y1 - by0)
+                sz0 = max(0, bbox_z0 - bz0);  sz1 = min(az, bbox_z1 - bz0)
 
                 dx0 = bx0 + sx0 - bbox_x0;  dx1 = dx0 + (sx1 - sx0)
                 dy0 = by0 + sy0 - bbox_y0;  dy1 = dy0 + (sy1 - sy0)
@@ -562,14 +561,13 @@ def _read_mask_from_syk(
         _log(f"[syglass to imaris] .syk: placed {n_placed} level-{max_level} blocks "
               f"(of {n_grid**3} possible)")
 
-        # The X block boundary leaves a 1-voxel gap (seam probe: '111111.|11111111'); Y/Z
-        # tile cleanly.  Fill any 0 voxel flanked by the SAME label on both sides — patches
-        # the seams without inventing data at mask edges (edges have a 0 on one side).
+        # Safety net: fill any residual 1-voxel seam (0 flanked by the SAME label on both
+        # sides).  With the per-axis strides above there should be none; harmless if so.
         vol = _fill_block_seams(vol)
         _log("[syglass to imaris] .syk: block-boundary seams filled")
 
-        # DIAGNOSTIC (after the fill): the profiles should now read '1111|1111' with no gap.
-        _probe_seams(vol, ux, uy, uz, (bbox_x0, bbox_y0, bbox_z0))
+        # DIAGNOSTIC: profiles should read '1111|1111' with no gap and no stray edge voxels.
+        _probe_seams(vol, ax, ay, az, (bbox_x0, bbox_y0, bbox_z0))
 
         clip_info = (bbox_x0, bbox_y0, bbox_z0, full_nx, full_ny, full_nz)
         return vol, clip_info
