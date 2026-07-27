@@ -478,11 +478,13 @@ def _read_mask_from_syk(
 
             max_level = max(_syk_block_level(bid) for bid in block_offset)
             n_grid    = 2 ** max_level
-            # Per-axis block geometry (from the aggregated apron diagnostic on real data):
-            #   X abuts — all cx voxels are real, keep them, stride cx.
-            #   Y, Z overlap by a shared apron slice — drop the last slice, stride c-1.
-            # ax/ay/az = unique voxels per block per axis (= placement size = stride).
-            ax, ay, az = cx, cy - 1, cz - 1
+            # Per-axis block geometry (measured on real mbls005 .syk — see the ghost-slice
+            # analysis).  X (the fastest-stored axis) carries a 1-voxel apron PLUS 2 trailing
+            # PADDING columns that copy the block's own column 0 (the 18024/30825 sentinels are
+            # these).  Placing them injects a ghost plane one block-width away in X — so drop
+            # X's apron + 2 padding (last 3).  Y and Z carry only a 1-voxel apron (drop last 1).
+            # ax/ay/az = unique voxels kept per block per axis (= placement size = stride).
+            ax, ay, az = cx - 3, cy - 1, cz - 1
             full_nx, full_ny, full_nz = n_grid * ax, n_grid * ay, n_grid * az
 
             _log(f"[syglass to imaris] .syk: {len(block_offset)} blocks; "
@@ -531,9 +533,9 @@ def _read_mask_from_syk(
                     continue
                 _lv, ix, iy, iz = _syk_block_position(bid)
 
-                bx0, bx1 = ix * ax, ix * ax + ax    # X abuts (stride cx, keep all cx)
-                by0, by1 = iy * ay, iy * ay + ay    # Y apron  (stride cy-1, drop last)
-                bz0, bz1 = iz * az, iz * az + az    # Z apron  (stride cz-1, drop last)
+                bx0, bx1 = ix * ax, ix * ax + ax    # X: stride cx-3 (apron + 2 padding dropped)
+                by0, by1 = iy * ay, iy * ay + ay    # Y: stride cy-1 (apron dropped)
+                bz0, bz1 = iz * az, iz * az + az    # Z: stride cz-1 (apron dropped)
 
                 if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
                 if by1 <= bbox_y0 or by0 >= bbox_y1: continue
@@ -541,11 +543,11 @@ def _read_mask_from_syk(
 
                 f.seek(boff + 24)
                 raw = f.read(block_payload)
-                # Drop the shared apron slice on Y and Z (last y, last z) but keep ALL of X.
-                # reshape is (cz, cy, cx); [:-1, :-1, :] drops last z & last y, keeps every x.
+                # reshape is (cz, cy, cx).  Drop last z & last y (aprons) and the last 3 x
+                # (X apron + 2 padding columns) → keep the unique (cx-3, cy-1, cz-1) voxels.
                 arr = (np.frombuffer(raw, dtype="<u2")
-                       .reshape(cz, cy, cx)[:-1, :-1, :]
-                       .transpose(2, 1, 0))   # (cx, cy-1, cz-1), uint16
+                       .reshape(cz, cy, cx)[:-1, :-1, :-3]
+                       .transpose(2, 1, 0))   # (cx-3, cy-1, cz-1), uint16
 
                 sx0 = max(0, bbox_x0 - bx0);  sx1 = min(ax, bbox_x1 - bx0)
                 sy0 = max(0, bbox_y0 - by0);  sy1 = min(ay, bbox_y1 - by0)
