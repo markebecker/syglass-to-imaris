@@ -172,6 +172,11 @@ def _run(imarisFile: int) -> None:
     sym_path = os.path.join(syk_dir, syk_stem + ".sym")
     _log(f"[syglass to imaris] using .syk: {syk_path}")
 
+    # Options menu: surface smoothing + troubleshooting toggle (persisted).
+    settings = _ask_settings()
+    _log(f"[syglass to imaris] options: smoothing sigma={settings['sigma']}  "
+         f"diagnostics={settings['diagnostics']}")
+
     # ----------------------------------------------------------------
     # 2. Read image dimensions and physical extents from Imaris
     # ----------------------------------------------------------------
@@ -210,7 +215,8 @@ def _run(imarisFile: int) -> None:
 
     prog.phase("Reading syGlass mask from .syk")
     t_read0 = time.time()
-    label_vol, clip_info = _read_mask_from_syk(syk_path, size_x, size_y, size_z)
+    label_vol, clip_info = _read_mask_from_syk(syk_path, size_x, size_y, size_z,
+                                               diagnostics=settings["diagnostics"])
 
     if label_vol is None or not np.any(label_vol):
         prog.close()
@@ -239,10 +245,11 @@ def _run(imarisFile: int) -> None:
     _log(f"[syglass to imaris] Found {len(label_ids)} labels: {label_ids}")
     prog.start_labels(len(label_ids))
 
-    # ASCII max-projections of the reconstructed mask so its actual shape is visible in the
-    # log (independent of Imaris) — useful for telling poor reconstruction from mask issues.
-    prog.phase("Rendering mask preview")
-    _log_mask_projections(label_vol)
+    # Troubleshooting only: ASCII max-projections of the reconstructed mask (shape sanity
+    # check, independent of Imaris).
+    if settings["diagnostics"]:
+        prog.phase("Rendering mask preview")
+        _log_mask_projections(label_vol)
 
     # ----------------------------------------------------------------
     # 4. Build one ISurfaces per label via AddSurface.
@@ -320,8 +327,9 @@ def _run(imarisFile: int) -> None:
 
     try:
         # max_workers=2 is enough for depth-1 pipelining and bounds concurrent prep RAM.
+        sigma = settings["sigma"]
         with ThreadPoolExecutor(max_workers=2) as pool:
-            next_future = pool.submit(_prep_label, label_vol, label_ids[0])
+            next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma)
             for label_idx, label_id in enumerate(label_ids):
                 tag = f"L{label_idx + 1}/{n_labels} (id {label_id})"
 
@@ -331,7 +339,7 @@ def _run(imarisFile: int) -> None:
                 t_prep = time.time() - t0
                 # Kick off prep for the next label so it overlaps this label's upload.
                 if label_idx + 1 < n_labels:
-                    next_future = pool.submit(_prep_label, label_vol, label_ids[label_idx + 1])
+                    next_future = pool.submit(_prep_label, label_vol, label_ids[label_idx + 1], sigma)
 
                 if prep is None:
                     _log(f"[syglass to imaris] {tag}: empty — skipped")
@@ -429,6 +437,7 @@ def _read_mask_from_syk(
     size_x: int,
     size_y: int,
     size_z: int,
+    diagnostics: bool = False,
 ):
     """
     Read the syGlass label mask from a .syk file.
@@ -490,10 +499,9 @@ def _read_mask_from_syk(
             _log(f"[syglass to imaris] .syk: {len(block_offset)} blocks; "
                   f"deepest level={max_level}  full grid={full_nx}×{full_ny}×{full_nz}")
 
-            # DIAGNOSTIC: are adjacent blocks overlapping (a shared ghost/apron slice)?
-            # This tells us the correct block stride so the seam/ghost-slab artifact can be
-            # fixed properly instead of guessed.
-            _diagnose_block_apron(f, block_offset, cx, cy, cz, max_level, block_payload)
+            # Troubleshooting only: per-axis apron/padding diagnostic on the raw blocks.
+            if diagnostics:
+                _diagnose_block_apron(f, block_offset, cx, cy, cz, max_level, block_payload)
 
             # Read root block to estimate mask bbox in root voxels, then scale up.
             # Use the full cx×cy×cz root block (ghost slices are fine here — they
@@ -566,10 +574,10 @@ def _read_mask_from_syk(
         # Safety net: fill any residual 1-voxel seam (0 flanked by the SAME label on both
         # sides).  With the per-axis strides above there should be none; harmless if so.
         vol = _fill_block_seams(vol)
-        _log("[syglass to imaris] .syk: block-boundary seams filled")
 
-        # DIAGNOSTIC: profiles should read '1111|1111' with no gap and no stray edge voxels.
-        _probe_seams(vol, ax, ay, az, (bbox_x0, bbox_y0, bbox_z0))
+        # Troubleshooting only: value profile across block boundaries (should read '1111|1111').
+        if diagnostics:
+            _probe_seams(vol, ax, ay, az, (bbox_x0, bbox_y0, bbox_z0))
 
         clip_info = (bbox_x0, bbox_y0, bbox_z0, full_nx, full_ny, full_nz)
         return vol, clip_info
@@ -808,24 +816,19 @@ def _read_counting_points_from_sym(
 # Mask smoothing
 # -----------------------------------------------------------------------
 
-def _prep_label(label_vol, label_id, iterations=3, margin=4):
+def _prep_label(label_vol, label_id, sigma=0.0, margin=4):
     """
-    Build the signed uint8 field AddSurface consumes for ONE label, CROPPED to that label's
-    bounding box (CPU-only, thread-safe — no COM/Ice access).
+    Build the signed uint8 field AddSurface meshes for ONE label, CROPPED to its bounding box
+    (CPU-only, thread-safe — no COM/Ice access).
 
-    Returns (field, (ox,oy,oz), n_painted, n_kept) or None if the label is empty:
-      field : (cnx,cny,cnz) uint8 crop, 100=inside / 200=outside.  Imaris reads uint8 as
-              signed int8 (100→+100, 200→−56) and meshes the zero crossing.
-      ox,oy,oz : crop origin in clip-voxel coords (caller sets the crop's µm extents).
-
-    Cropping is the speed/memory win: the reconstruction can be billions of voxels while a
-    label occupies a tiny fraction, so we smooth and upload only the bbox.  A `margin` of
-    outside voxels is left around the box so the smoothed field returns to "outside" and the
-    surface closes inside the crop.  Smoothing is UNION-ed with the original voxels so nothing
-    painted is ever eroded.
-
-    NOTE: this relies on AddSurface honouring the cropped IDataSet's SetExtendMin/Max — to be
-    validated on a known-good .syk (a corrupted .syk previously masked whether this works).
+    Returns (field, (ox,oy,oz), n_painted, n_kept) or None if the label is empty.  Imaris reads
+    the uint8 as signed int8 and meshes the zero crossing:
+      sigma <= 0 : binary 100 (inside) / 200 (outside) — voxel fidelity (blocky surface,
+                   nothing eroded).
+      sigma  > 0 : a Gaussian-blurred GRADIENT (+inside … −outside, 0 at the boundary), so
+                   Imaris' marching cubes interpolates a SMOOTH triangulated surface; larger
+                   sigma = smoother (and rounds off / drops fine detail).
+    `margin` grows with sigma so the blur has room to fall back to "outside" inside the crop.
     """
     mask = label_vol == label_id
     xs = np.any(mask, axis=(1, 2))
@@ -834,9 +837,11 @@ def _prep_label(label_vol, label_id, iterations=3, margin=4):
     ys = np.any(mask, axis=(0, 2))
     zs = np.any(mask, axis=(0, 1))
 
+    m = max(margin, int(np.ceil(3 * sigma)) + 1)   # room for the Gaussian tail
+
     def _span(flags, n):
         idx = np.nonzero(flags)[0]
-        return max(0, int(idx[0]) - margin), min(n, int(idx[-1]) + 1 + margin)
+        return max(0, int(idx[0]) - m), min(n, int(idx[-1]) + 1 + m)
 
     ox, x1 = _span(xs, mask.shape[0])
     oy, y1 = _span(ys, mask.shape[1])
@@ -846,9 +851,19 @@ def _prep_label(label_vol, label_id, iterations=3, margin=4):
     del mask
     n_painted = int(sub.sum())
 
-    keep = (_smooth_mask_3d(sub, iterations=iterations) > 0.5) | sub   # never erode
-    field = np.where(keep, 100, 200).astype(np.uint8)
-    return field, (ox, oy, oz), n_painted, int(keep.sum())
+    if sigma > 0:
+        try:
+            from scipy.ndimage import gaussian_filter
+            blur = gaussian_filter(sub.astype(np.float32), sigma=sigma)
+        except Exception:
+            blur = _smooth_mask_3d(sub, iterations=max(1, int(round(2 * sigma))))
+        signed = np.clip((blur - 0.5) * 200.0, -120, 120)     # +inside, −outside, 0 at surface
+        field = signed.astype(np.int8).view(np.uint8)
+    else:
+        field = np.where(sub, 100, 200).astype(np.uint8)      # blocky, voxel fidelity
+
+    n_kept = int((field.view(np.int8) > 0).sum())
+    return field, (ox, oy, oz), n_painted, n_kept
 
 
 def _ascii_projection(occ_2d, cols=64, rows=26):
@@ -1049,6 +1064,82 @@ def _ask_for_syk(initialdir: str) -> str | None:
     except Exception as exc:
         _log(f"[syglass to imaris] file dialog unavailable: {exc}")
     return None
+
+
+# -----------------------------------------------------------------------
+# Options menu
+# -----------------------------------------------------------------------
+
+# Surface-smoothing presets: label → Gaussian blur sigma (voxels).  0 = raw voxel fidelity.
+_SMOOTHING_LEVELS = [
+    ("None — voxel fidelity (blocky)", 0.0),
+    ("Light", 0.8),
+    ("Medium", 1.5),
+    ("Strong", 2.5),
+]
+
+
+def _ask_settings() -> dict:
+    """
+    Show an options menu (tkinter) and return {'sigma': float, 'diagnostics': bool}.
+
+    Lets the user pick a surface-smoothing preset or type a custom blur, and toggle
+    troubleshooting (which turns the block diagnostics + mask preview back on in the log).
+    Choices persist in the config so they default to last time.  Falls back to the saved
+    defaults if no GUI is available.
+    """
+    cfg = _load_config()
+    defaults = {"sigma": float(cfg.get("smoothing_sigma", 0.0)),
+                "diagnostics": bool(cfg.get("diagnostics", False))}
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("syGlass → Imaris — options")
+        root.attributes("-topmost", True)
+
+        tk.Label(root, text="Surface smoothing (Gaussian blur — smoother = less voxel detail):",
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        # If the saved sigma matches a preset, select it; otherwise select None and prefill custom.
+        preset_vals = [v for _, v in _SMOOTHING_LEVELS]
+        sigma_var = tk.DoubleVar(value=defaults["sigma"] if defaults["sigma"] in preset_vals else 0.0)
+        for name, val in _SMOOTHING_LEVELS:
+            tk.Radiobutton(root, text=name, variable=sigma_var, value=val,
+                           anchor="w").pack(fill="x", padx=26)
+        crow = tk.Frame(root); crow.pack(fill="x", padx=26, pady=(4, 2))
+        tk.Label(crow, text="…or custom blur:").pack(side="left")
+        custom = tk.Entry(crow, width=8); custom.pack(side="left", padx=6)
+        if defaults["sigma"] not in preset_vals:
+            custom.insert(0, str(defaults["sigma"]))
+
+        diag_var = tk.BooleanVar(value=defaults["diagnostics"])
+        tk.Checkbutton(root, text="Troubleshooting: log block diagnostics + mask preview",
+                       variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+
+        out = {}
+        def _ok():
+            s = float(sigma_var.get())
+            c = custom.get().strip()
+            if c:
+                try:
+                    s = float(c)
+                except ValueError:
+                    pass
+            out["sigma"] = max(0.0, s)
+            out["diagnostics"] = bool(diag_var.get())
+            root.quit()
+        tk.Button(root, text="Run", width=12, command=_ok).pack(pady=12)
+        root.protocol("WM_DELETE_WINDOW", _ok)
+        root.mainloop()
+        root.destroy()
+
+        result = out or defaults
+        cfg["smoothing_sigma"] = result["sigma"]
+        cfg["diagnostics"] = result["diagnostics"]
+        _save_config(cfg)
+        return result
+    except Exception as exc:
+        _log(f"[syglass to imaris] options menu unavailable ({exc}); using saved defaults {defaults}")
+        return defaults
 
 
 # -----------------------------------------------------------------------
