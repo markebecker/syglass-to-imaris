@@ -108,7 +108,11 @@ def main() -> int:
                 cache[bid] = read_u16(f.read(payload))
             return cache[bid]
 
-        for axis, name, dim in ((2, "X", cx), (1, "Y", cy), (0, "Z", cz)):
+        # (axis, name, length along that axis, and the sizes of the two transverse
+        # coordinates as `line` takes them: axis 2 -> (y, z), 1 -> (x, z), 0 -> (x, y))
+        for axis, name, dim, dim_a, dim_b in ((2, "X", cx, cy, cz),
+                                              (1, "Y", cy, cx, cz),
+                                              (0, "Z", cz, cx, cy)):
             # Parents whose two children along this axis both exist AND that carry paint —
             # an empty parent yields no evidence at any stride.
             step_xyz = (1 if axis == 2 else 0,      # axis 2 = X, 1 = Y, 0 = Z
@@ -143,11 +147,13 @@ def main() -> int:
                     A = read_block(lo_id)
                     B = read_block(hi_id)
                     done = 0
-                    # transverse samples inside the lower child (so no transverse
-                    # child boundary complicates the mapping)
-                    step = max(1, (s // 2) // 12)
-                    for j in range(0, min(s // 2, dim // 2), step):
-                        for k in range(0, min(s // 2, dim // 2), step):
+                    # Transverse samples inside the lower child, so no transverse child
+                    # boundary complicates the mapping.  The bounds come from the two
+                    # TRANSVERSE dimensions, not from `dim` — for the X axis the
+                    # transverse coordinates index Y and Z, which have their own sizes.
+                    step = max(1, (min(dim_a, dim_b) // 2) // 12)
+                    for j in range(0, (dim_a - 1) // 2, step):
+                        for k in range(0, (dim_b - 1) // 2, step):
                             if done >= args.lines:
                                 break
                             pl_ = line(P, cx, cy, cz, axis, j, k)
