@@ -236,7 +236,8 @@ def _run(imarisFile: int) -> None:
         _log("options menu cancelled — nothing imported.")
         return
     _log(f"options: smoothing sigma={settings['sigma']}  "
-         f"diagnostics={settings['diagnostics']}  spots={settings['spots']}")
+         f"diagnostics={settings['diagnostics']}  spots={settings['spots']}  "
+         f"block trim={settings['trim']}")
 
     # ----------------------------------------------------------------
     # 2. Read image dimensions and physical extents from Imaris
@@ -260,7 +261,8 @@ def _run(imarisFile: int) -> None:
     t_read0 = time.time()
     # label_vol: (NX, NY, NZ) uint16, 0=background, 1..N=label.
     # clip_info: (vx0, vy0, vz0, full_nx, full_ny, full_nz) — the sub-region that was read.
-    label_vol, clip_info = _read_mask_from_syk(syk_path, diagnostics=settings["diagnostics"])
+    label_vol, clip_info = _read_mask_from_syk(syk_path, diagnostics=settings["diagnostics"],
+                                               trim=settings["trim"])
 
     if label_vol is None or not np.any(label_vol):
         prog.close()
@@ -552,7 +554,8 @@ def _import_counting_points(factory, scene, sym_path: str, geom: _Geometry,
 # Mask reader: manual .syk parser (main)
 # -----------------------------------------------------------------------
 
-def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
+def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
+                        trim=(3, 1, 1)):
     """
     Read the syGlass label mask from a .syk file.
 
@@ -608,7 +611,11 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
             # ax/ay/az = unique voxels kept per block per axis (= placement size = stride).
             # _check_block_aprons below re-measures this on the file at hand and warns if
             # the assumption does not hold.
-            ax, ay, az = cx - 3, cy - 1, cz - 1
+            tx, ty, tz = (int(v) for v in trim)
+            ax, ay, az = cx - tx, cy - ty, cz - tz
+            if min(ax, ay, az) < 1:
+                _log(f".syk: block trim {trim} is larger than the block; aborting")
+                return None, None
             full_nx, full_ny, full_nz = n_grid * ax, n_grid * ay, n_grid * az
 
             _log(f".syk: {len(block_offset)} blocks; "
@@ -685,11 +692,12 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
 
                 f.seek(boff + 24)
                 raw = f.read(block_payload)
-                # reshape is (cz, cy, cx).  Drop last z & last y (aprons) and the last 3 x
-                # (X apron + 2 padding columns) → keep the unique (cx-3, cy-1, cz-1) voxels.
+                # Stored (cz, cy, cx).  Keep the leading (ax, ay, az) voxels — the trailing
+                # `trim` slices per axis are dropped as overlap/padding — then transpose to
+                # the (X, Y, Z) convention.
                 arr = (np.frombuffer(raw, dtype="<u2")
-                       .reshape(cz, cy, cx)[:-1, :-1, :-3]
-                       .transpose(2, 1, 0))   # (cx-3, cy-1, cz-1), uint16
+                       .reshape(cz, cy, cx)[:az, :ay, :ax]
+                       .transpose(2, 1, 0))   # (ax, ay, az), uint16
                 if scale > 1:
                     arr = arr.repeat(scale, 0).repeat(scale, 1).repeat(scale, 2)
 
@@ -1280,6 +1288,11 @@ def _ask_for_syk(initialdir: str) -> str | None:
 # Options menu
 # -----------------------------------------------------------------------
 
+# Voxels dropped from the trailing edge of each block per axis, i.e. block_dim - stride.
+# Derived empirically; the correct values are still uncertain and appear to be the cause of
+# a periodic block-boundary artifact, so the options menu exposes them for testing.
+_DEFAULT_TRIM = (3, 1, 1)
+
 # Surface-smoothing presets: label → Gaussian blur sigma (voxels).  0 = raw voxel fidelity.
 _SMOOTHING_LEVELS = [
     ("None — voxel fidelity (blocky)", 0.0),
@@ -1302,7 +1315,8 @@ def _ask_settings() -> dict | None:
     cfg = _load_config()
     defaults = {"sigma": float(cfg.get("smoothing_sigma", 0.0)),
                 "diagnostics": bool(cfg.get("diagnostics", False)),
-                "spots": bool(cfg.get("spots", False))}
+                "spots": bool(cfg.get("spots", False)),
+                "trim": tuple(cfg.get("trim", _DEFAULT_TRIM))}
     try:
         import tkinter as tk
         root = tk.Tk()
@@ -1338,6 +1352,15 @@ def _ask_settings() -> dict | None:
         tk.Checkbutton(root, text="Troubleshooting: log block diagnostics + mask preview",
                        variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 2))
 
+        tk.Label(root, text="Advanced — block trim X,Y,Z (voxels dropped from each block "
+                            "edge):", anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        trim_entry = tk.Entry(root, width=12)
+        trim_entry.insert(0, ",".join(str(v) for v in defaults["trim"]))
+        trim_entry.pack(anchor="w", padx=26)
+        tk.Label(root, text=f"(default {','.join(str(v) for v in _DEFAULT_TRIM)}; change "
+                            f"only to diagnose block-boundary artifacts)",
+                 anchor="w", fg="grey").pack(fill="x", padx=26)
+
         spots_var = tk.BooleanVar(value=defaults["spots"])
         tk.Checkbutton(root, text="EXPERIMENTAL: import .sym counting points (positions unverified)",
                        variable=spots_var, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
@@ -1356,6 +1379,11 @@ def _ask_settings() -> dict | None:
             out["sigma"] = max(0.0, s)
             out["diagnostics"] = bool(diag_var.get())
             out["spots"] = bool(spots_var.get())
+            try:
+                parts = [int(p) for p in trim_entry.get().replace(" ", "").split(",")]
+                out["trim"] = tuple(parts) if len(parts) == 3 else defaults["trim"]
+            except ValueError:
+                out["trim"] = defaults["trim"]
             root.quit()
 
         def _cancel():
@@ -1376,6 +1404,7 @@ def _ask_settings() -> dict | None:
         cfg["smoothing_sigma"] = result["sigma"]
         cfg["diagnostics"] = result["diagnostics"]
         cfg["spots"] = result["spots"]
+        cfg["trim"] = list(result["trim"])
         _save_config(cfg)
         return result
     except Exception as exc:
