@@ -647,18 +647,37 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
         # this halves the footprint of the volume and the bandwidth of every scan over it.
         vol = np.zeros((clip_nx, clip_ny, clip_nz), dtype=np.uint16)
 
-        # Pass 2 — read max_level blocks within bbox and place them
+        # Pass 2 — place every LEAF block within the bbox.
+        #
+        # The octree is adaptive: a block whose children are absent from the file is a leaf
+        # holding its region's mask at its own (coarser) resolution.  Reading only the
+        # deepest level therefore drops data — on one test file 478 of 512 level-3 blocks
+        # were childless and carried mask, so all but 34 regions came out empty.  Whether a
+        # given file is adaptive or uniform varies: a second file stored everything at the
+        # deepest level and read correctly either way.  tools/octree_structure.py reports
+        # which shape a file has.
+        #
+        # A leaf at level L is coarser than the finest grid by scale = 2**(max_level - L),
+        # so each of its voxels covers a scale**3 cube and is expanded on placement.
+        has_child = set()
+        for bid in block_offset:
+            if bid:
+                has_child.add((bid - 1) // 8)
+
         with open(syk_path, "rb") as f:
             n_placed = 0
             n_sentinel = 0
+            per_level = {}
             for bid, boff in block_offset.items():
-                if _syk_block_level(bid) != max_level:
-                    continue
-                _lv, ix, iy, iz = _syk_block_position(bid)
+                if bid in has_child:
+                    continue                      # interior node: its children hold the data
+                lv, ix, iy, iz = _syk_block_position(bid)
+                scale = 1 << (max_level - lv)     # finest voxels per voxel of this block
+                sx, sy, sz = ax * scale, ay * scale, az * scale   # span in finest voxels
 
-                bx0, bx1 = ix * ax, ix * ax + ax    # X: stride cx-3 (apron + 2 padding dropped)
-                by0, by1 = iy * ay, iy * ay + ay    # Y: stride cy-1 (apron dropped)
-                bz0, bz1 = iz * az, iz * az + az    # Z: stride cz-1 (apron dropped)
+                bx0, bx1 = ix * sx, ix * sx + sx
+                by0, by1 = iy * sy, iy * sy + sy
+                bz0, bz1 = iz * sz, iz * sz + sz
 
                 if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
                 if by1 <= bbox_y0 or by0 >= bbox_y1: continue
@@ -671,17 +690,19 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
                 arr = (np.frombuffer(raw, dtype="<u2")
                        .reshape(cz, cy, cx)[:-1, :-1, :-3]
                        .transpose(2, 1, 0))   # (cx-3, cy-1, cz-1), uint16
+                if scale > 1:
+                    arr = arr.repeat(scale, 0).repeat(scale, 1).repeat(scale, 2)
 
-                sx0 = max(0, bbox_x0 - bx0);  sx1 = min(ax, bbox_x1 - bx0)
-                sy0 = max(0, bbox_y0 - by0);  sy1 = min(ay, bbox_y1 - by0)
-                sz0 = max(0, bbox_z0 - bz0);  sz1 = min(az, bbox_z1 - bz0)
+                cx0 = max(0, bbox_x0 - bx0);  cx1 = min(sx, bbox_x1 - bx0)
+                cy0 = max(0, bbox_y0 - by0);  cy1 = min(sy, bbox_y1 - by0)
+                cz0 = max(0, bbox_z0 - bz0);  cz1 = min(sz, bbox_z1 - bz0)
 
-                dx0 = bx0 + sx0 - bbox_x0;  dx1 = dx0 + (sx1 - sx0)
-                dy0 = by0 + sy0 - bbox_y0;  dy1 = dy0 + (sy1 - sy0)
-                dz0 = bz0 + sz0 - bbox_z0;  dz1 = dz0 + (sz1 - sz0)
+                dx0 = bx0 + cx0 - bbox_x0;  dx1 = dx0 + (cx1 - cx0)
+                dy0 = by0 + cy0 - bbox_y0;  dy1 = dy0 + (cy1 - cy0)
+                dz0 = bz0 + cz0 - bbox_z0;  dz1 = dz0 + (cz1 - cz0)
 
                 dst = vol[dx0:dx1, dy0:dy1, dz0:dz1]     # view into vol
-                dst[...] = arr[sx0:sx1, sy0:sy1, sz0:sz1]
+                dst[...] = arr[cx0:cx1, cy0:cy1, cz0:cz1]
 
                 # Erase storage sentinels (18024/30825 and friends) as each block lands.
                 # With the strides above they are sliced off before placement, so this
@@ -695,9 +716,15 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
                     dst[bad] = 0
                     n_sentinel += n_bad
                 n_placed += 1
+                per_level[lv] = per_level.get(lv, 0) + 1
 
-        _log(f".syk: placed {n_placed} level-{max_level} blocks "
-             f"(of {n_grid ** 3} possible)")
+        levels_txt = ", ".join(f"L{lv}:{n}" for lv, n in sorted(per_level.items()))
+        _log(f".syk: placed {n_placed} leaf block(s) — {levels_txt}"
+             f"  (deepest level {max_level}, {n_grid ** 3} slots)")
+        if any(lv < max_level for lv in per_level):
+            coarse = sum(n for lv, n in per_level.items() if lv < max_level)
+            _log(f".syk: adaptive octree — {coarse} leaf block(s) sit above the deepest "
+                 f"level and were upsampled into place")
         if n_sentinel:
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
