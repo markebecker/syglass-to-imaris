@@ -644,7 +644,7 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
              f"(origin {bbox_x0},{bbox_y0},{bbox_z0})")
 
         # uint16 (not uint32): the .syk payload is already uint16 and label IDs fit, so
-        # this halves the memory bandwidth of the seam fill and every downstream scan.
+        # this halves the footprint of the volume and the bandwidth of every scan over it.
         vol = np.zeros((clip_nx, clip_ny, clip_nz), dtype=np.uint16)
 
         # Pass 2 — read max_level blocks within bbox and place them
