@@ -97,9 +97,6 @@ _PREP_MARGIN_VOXELS = 4
 # Radius given to imported counting points.
 _SPOT_RADIUS_UM = 0.5
 
-# Raw blocks the apron/seam diagnostics may hold in memory at once.
-_APRON_CACHE_BLOCKS = 16
-
 # Remembers the options-menu choices between runs.
 _CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".import_from_syglass_xt.json")
 
