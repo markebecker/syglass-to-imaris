@@ -169,7 +169,7 @@ def _warn(msg: str) -> None:
 
 #   <CustomTools>
 #       <Menu>
-#           <Item name="Import from syGlass" icon="Python3"
+#           <Item name="Import from syGlass (Development)" icon="Python3"
 #                 tooltip="Import syGlass masks and counting points into the current scene">
 #               <Command>Python3XT::XTImportFromSyGlass(%i)</Command>
 #           </Item>
