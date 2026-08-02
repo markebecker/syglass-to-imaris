@@ -18,9 +18,7 @@ Masks:
      scanned to inventory the octree; the root block (a whole-volume preview downsampled
      by 2**max_level) gives a cheap bounding-box estimate; only the deepest-level blocks
      inside that box are then read and composited.  Blocks are stored (CZ, CY, CX) and
-     tile the volume without overlap — see _read_mask_from_syk for how that was measured.
-     A syGlass voxel is an .ims voxel; the octree grid is just rounded up to a whole
-     number of blocks.
+     overlap their neighbours — see _read_mask_from_syk for the per-axis geometry.
   2. For each label, build a signed uint8 field cropped to that label's bounding box
      (sigma <= 0: binary 100=inside / 200=outside; sigma > 0: a clipped Gaussian
      gradient), and upload it in bands via SetDataSubVolumeAs1DArrayBytes, each call
@@ -99,19 +97,16 @@ _PREP_MARGIN_VOXELS = 4
 # Radius given to imported counting points.
 _SPOT_RADIUS_UM = 0.5
 
-# syGlass rounds its octree grid up to a whole number of blocks, so the grid normally sits
-# a few voxels past the image.  Warn if it overshoots by more than a whole block (the
-# stride is probably wrong) or falls short of the image by more than this many voxels
-# (image data would have nowhere to live).
-_GRID_SHORTFALL_TOLERANCE = 2
+# Warn when the reconstructed syGlass grid and the .ims voxel grid disagree by more than
+# this fraction — the mask is stretched to the .ims extents, so a mismatch is problematic.
+_GRID_RATIO_TOLERANCE = 0.01
 
-# Block-overlap self-check (see _measure_block_aprons): adjacent block pairs to sample per
-# axis, how many pairs to look through while hunting for ones with paint at the boundary,
-# how much paint a boundary needs to count as evidence, and the raw-block cache bound.
-_APRON_CHECK_PAIRS = 6
-_APRON_SCAN_LIMIT = 80
-_APRON_MIN_PAINT = 500
-_APRON_CACHE_BLOCKS = 16
+# Block-overlap self-check (see _measure_block_aprons): how many adjacent block pairs per
+# axis to sample on a normal run, how much a shared apron must beat the baseline
+# agreement to count as present, and how many raw blocks the reader may cache.
+_APRON_CHECK_PAIRS = 8
+_APRON_MARGIN = 0.30
+_APRON_CACHE_BLOCKS = 64
 
 # Remembers the options-menu choices between runs.
 _CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".import_from_syglass_xt.json")
@@ -354,17 +349,8 @@ def _clip_extents(geom: _Geometry, clip_info, vol_shape):
     """
     Physical extents (µm) spanned by the reconstructed volume.
 
-    A syGlass voxel IS an .ims voxel — syGlass ingests the image at full resolution and
-    only rounds the octree grid up to a whole number of blocks, so the grid is the image
-    grid plus a few voxels of slack at the far edge.  The mapping therefore uses the .ims
-    voxel size directly and treats syGlass voxel (i,j,k) as .ims voxel (i,j,k).
-
-    An earlier version derived the voxel size as (extent span / full syGlass grid), which
-    silently rescaled the mask by however much the grid differed from the image — 1.8% in X
-    on the first test file, about 186 µm.  Nothing is stored anywhere in the .syk (header,
-    block headers, or the INDX footer) that would let syGlass centre the image inside the
-    grid, so the origin-aligned reading is the only one it could round-trip.
-
+    The mask is stretched onto the .ims extents, so the µm size of one syGlass voxel comes
+    from the FULL syGlass grid; the clipped sub-volume then occupies its own slice of that.
     Returns (lo_xyz, hi_xyz, full_grid_xyz).
     """
     shape = np.asarray(vol_shape, dtype=np.float64)
@@ -372,8 +358,9 @@ def _clip_extents(geom: _Geometry, clip_info, vol_shape):
         return geom.ext_min.copy(), geom.ext_max.copy(), shape
     origin = np.asarray(clip_info[:3], dtype=np.float64)
     full   = np.asarray(clip_info[3:], dtype=np.float64)
-    lo = geom.ext_min + origin * geom.voxel_size
-    hi = geom.ext_min + (origin + shape) * geom.voxel_size
+    per_voxel = (geom.ext_max - geom.ext_min) / full
+    lo = geom.ext_min + origin * per_voxel
+    hi = geom.ext_min + (origin + shape) * per_voxel
     return lo, hi, full
 
 
@@ -453,23 +440,16 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
     _log(f"IDataSet extents: X=[{ds_lo[0]:.1f}, {ds_hi[0]:.1f}] "
          f"Y=[{ds_lo[1]:.1f}, {ds_hi[1]:.1f}] Z=[{ds_lo[2]:.1f}, {ds_hi[2]:.1f}]")
 
-    # syGlass rounds the octree grid up to a whole number of blocks, so a small positive
-    # slack past the image is expected and harmless — voxels there simply never hold mask.
-    # A grid SHORTER than the image, or longer by more than one block, means the stride is
-    # wrong, and since voxels map 1:1 that shows up as a shifted mask rather than a scaled
-    # one.
-    slack = full_grid - geom.size
-    _log(f"syk grid vs .ims: X={int(slack[0]):+d}  Y={int(slack[1]):+d}  "
-         f"Z={int(slack[2]):+d} voxel(s) of slack")
-    for i, name in enumerate("XYZ"):
-        if slack[i] < -_GRID_SHORTFALL_TOLERANCE:
-            _warn(f"{name}: the syGlass grid is {int(-slack[i])} voxel(s) SHORTER than the "
-                  f".ims. Part of the image cannot be represented, so the block stride is "
-                  f"probably wrong for this file.")
-        elif slack[i] < 0:
-            _log(f"note: syGlass grid is {int(-slack[i])} voxel(s) short of the .ims in "
-                 f"{name}; syGlass floors the grid, so the final {name} slice is not "
-                 f"covered by the mask.")
+    # The mask is stretched to fill the .ims extents, so a syGlass grid that does not match
+    # the .ims voxel grid is a registration error rather than a cosmetic mismatch.
+    ratios = geom.size / full_grid
+    _log(f"ims/syk ratio: X={ratios[0]:.2f}  Y={ratios[1]:.2f}  Z={ratios[2]:.2f}")
+    for name, ratio in zip("XYZ", ratios):
+        if abs(ratio - 1.0) > _GRID_RATIO_TOLERANCE:
+            _warn(f"{name}: reconstructed syGlass grid is {abs(1.0 - ratio) * 100:.1f}% "
+                  f"{'smaller' if ratio > 1 else 'larger'} than the .ims grid. The mask is "
+                  f"scaled onto the .ims extents, so surfaces may be misregistered along "
+                  f"{name}. Check the block geometry in _read_mask_from_syk against this file.")
 
     # Physical size of one clip voxel — converts each label's crop (in clip-voxel coords)
     # into the µm extents of its own IDataSet.
@@ -620,22 +600,15 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
 
             max_level = max(_syk_block_level(bid) for bid in block_offset)
             n_grid    = 2 ** max_level
-            # Blocks TILE the volume — they do not overlap.  The stride on every axis is
-            # the full block dimension, so nothing is dropped when placing them.
-            #
-            # This was measured, not assumed: for adjacent blocks A and B, no slice of A is
-            # ever byte-identical to B's first slice (0 of 8 pairs on every axis of two
-            # different files).  A shared apron is a literal copy, so it would score 1.0.
-            # The earlier belief in a 1-voxel apron came from comparing only PAINTED voxels,
-            # where neighbouring slices of a smooth mask agree ~0.9 purely by spatial
-            # autocorrelation.  tools/inspect_syk.py performs that measurement.
-            #
-            # Corroboration: syGlass picks the block dimension as
-            #     c = floor(image_size / 2**depth) rounded up to a multiple of 4,
-            # which reproduces all six axes of both test files exactly, and only tiling
-            # (never a shared apron) yields a grid large enough to hold the image.
-            # _check_block_aprons re-runs the test per file and warns if one ever differs.
-            ax, ay, az = cx, cy, cz
+            # Per-axis block geometry (measured from real .syk).  X (the fastest-stored
+            # axis) carries a 1-voxel apron PLUS 2 trailing PADDING columns that copy the
+            # block's own column 0 (the 18024/30825 sentinels are these).  Placing them
+            # injects a ghost plane one block-width away in X — so drop X's apron + 2
+            # padding (last 3).  Y and Z carry only a 1-voxel apron (drop last 1).
+            # ax/ay/az = unique voxels kept per block per axis (= placement size = stride).
+            # _check_block_aprons below re-measures this on the file at hand and warns if
+            # the assumption does not hold.
+            ax, ay, az = cx - 3, cy - 1, cz - 1
             full_nx, full_ny, full_nz = n_grid * ax, n_grid * ay, n_grid * az
 
             _log(f".syk: {len(block_offset)} blocks; "
@@ -683,9 +656,9 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
                     continue
                 _lv, ix, iy, iz = _syk_block_position(bid)
 
-                bx0, bx1 = ix * ax, ix * ax + ax    # blocks abut: stride == block dimension
-                by0, by1 = iy * ay, iy * ay + ay
-                bz0, bz1 = iz * az, iz * az + az
+                bx0, bx1 = ix * ax, ix * ax + ax    # X: stride cx-3 (apron + 2 padding dropped)
+                by0, by1 = iy * ay, iy * ay + ay    # Y: stride cy-1 (apron dropped)
+                bz0, bz1 = iz * az, iz * az + az    # Z: stride cz-1 (apron dropped)
 
                 if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
                 if by1 <= bbox_y0 or by0 >= bbox_y1: continue
@@ -693,11 +666,11 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False):
 
                 f.seek(boff + 24)
                 raw = f.read(block_payload)
-                # Stored (cz, cy, cx); blocks tile without overlap, so every voxel is
-                # unique and none is dropped.  Transpose to the (X, Y, Z) convention.
+                # reshape is (cz, cy, cx).  Drop last z & last y (aprons) and the last 3 x
+                # (X apron + 2 padding columns) → keep the unique (cx-3, cy-1, cz-1) voxels.
                 arr = (np.frombuffer(raw, dtype="<u2")
-                       .reshape(cz, cy, cx)
-                       .transpose(2, 1, 0))   # (cx, cy, cz), uint16
+                       .reshape(cz, cy, cx)[:-1, :-1, :-3]
+                       .transpose(2, 1, 0))   # (cx-3, cy-1, cz-1), uint16
 
                 sx0 = max(0, bbox_x0 - bx0);  sx1 = min(ax, bbox_x1 - bx0)
                 sy0 = max(0, bbox_y0 - by0);  sy1 = min(ay, bbox_y1 - by0)
@@ -781,21 +754,19 @@ def _syk_block_position(block_id: int):
 # -----------------------------------------------------------------------
 
 def _measure_block_aprons(f, block_offset, cx, cy, cz, max_level, block_payload,
-                          max_pairs=_APRON_CHECK_PAIRS, min_paint=_APRON_MIN_PAINT):
+                          max_pairs=None):
     """
-    Test whether deepest-level blocks share an apron with their neighbours, per axis.
+    Measure how deepest-level blocks overlap their neighbours, per axis.
 
-    For adjacent blocks A and B, an apron means some slice of A is a literal copy of B's
-    first slice.  So the test is EXACT equality of the whole slice, background included —
-    not agreement over painted voxels, which is inflated to ~0.9 by nothing more than
-    neighbouring slices of a smooth mask looking alike.  That confound is what originally
-    produced the mistaken 1-voxel-apron reading.
+    For adjacent blocks A (at i) and B (at i+1) this accumulates painted-voxel agreement of:
+      high = A.last-slice  vs B.first-slice   (high-side apron: A's last duplicates boundary)
+      low  = A.first-slice vs prev.last-slice (low-side apron:  A's first duplicates boundary)
+      base = A.mid-slice   vs B.mid-slice     (baseline for a smoothly-varying volume)
+      self = A.last-slice  vs A.first-slice   (padding: A's last is a copy of its own first)
+    Interpretation: high ≫ base ⇒ A's LAST slice is a shared apron; self ≈ 1 ⇒ A's last
+    slice is padding rather than real data.
 
-    Only pairs with at least `min_paint` painted voxels at the boundary are used; a blindly
-    chosen boundary slice in a 0.3%-full volume is usually empty and carries no evidence.
-
-    Returns {"X": {"stride": int|None, "pairs": int}} where stride is the apron-implied
-    stride if an exact duplicate was found, else None (meaning the blocks tile).
+    Returns {"X": {...}, "Y": {...}, "Z": {...}} of ratios plus pair/voxel counts.
     """
     pos2bid = {}
     for bid in block_offset:
@@ -813,70 +784,85 @@ def _measure_block_aprons(f, block_offset, cx, cy, cz, max_level, block_payload,
             cache[bid] = np.frombuffer(f.read(block_payload), dtype="<u2").reshape(cz, cy, cx)
         return cache[bid]
 
+    def _acc(a, b, tot):
+        m = (a > 0) | (b > 0)
+        return (tot[0] + int(np.sum(a[m] == b[m])), tot[1] + int(m.sum()))
+
+    def _ratio(t):
+        return (t[0] / t[1]) if t[1] else float("nan")
+
     results = {}
     # The payload is stored (cz, cy, cx), so array axis 2 is X, 1 is Y, 0 is Z.
     for axis, name, dim in ((2, "X", cx), (1, "Y", cy), (0, "Z", cz)):
         unit = {2: (1, 0, 0), 1: (0, 1, 0), 0: (0, 0, 1)}[axis]
-        used = examined = 0
-        hits = {}
+        hi = lo = base = slf = (0, 0)
+        npairs = 0
         for pos, bid in pos2bid.items():
-            if used >= max_pairs or examined >= _APRON_SCAN_LIMIT:
+            if max_pairs is not None and npairs >= max_pairs:
                 break
             nb = tuple(p + u for p, u in zip(pos, unit))
-            if nb not in pos2bid:
-                continue
-            examined += 1
-            A, B = _read(bid), _read(pos2bid[nb])
-            b0 = np.take(B, 0, axis=axis)
-            # Scale the evidence bar to the slice: a fixed count larger than the slice
-            # itself would silently disqualify every pair on small-block files.
-            need = min(min_paint, max(1, b0.size // 10))
-            if int(np.count_nonzero(b0)) < need:
-                continue
-            for j in range(dim):
-                if np.array_equal(np.take(A, j, axis=axis), b0):
-                    hits[j] = hits.get(j, 0) + 1
-            used += 1
-        stride = None
-        for j, n in hits.items():
-            if n == used and used > 0:
-                stride = j
-                break
-        results[name] = {"stride": stride, "pairs": used, "examined": examined}
+            if nb in pos2bid:
+                A, B = _read(bid), _read(pos2bid[nb])
+                hi   = _acc(np.take(A, dim - 1, axis=axis), np.take(B, 0, axis=axis), hi)
+                base = _acc(np.take(A, dim // 2, axis=axis), np.take(B, dim // 2, axis=axis), base)
+                slf  = _acc(np.take(A, dim - 1, axis=axis), np.take(A, 0, axis=axis), slf)
+                npairs += 1
+            pb = tuple(p - u for p, u in zip(pos, unit))
+            if pb in pos2bid:
+                A, P = _read(bid), _read(pos2bid[pb])
+                lo = _acc(np.take(A, 0, axis=axis), np.take(P, dim - 1, axis=axis), lo)
+        results[name] = {"high": _ratio(hi), "low": _ratio(lo), "base": _ratio(base),
+                         "self": _ratio(slf), "pairs": npairs, "voxels": hi[1]}
     return results
 
 
 def _check_block_aprons(f, block_offset, cx, cy, cz, max_level, block_payload,
                         verbose=False) -> None:
     """
-    Verify on the file at hand that blocks really do tile without overlap.
+    Verify the hardcoded per-axis block strides against the file actually being read.
 
-    The reader places every block at a stride equal to its full dimension.  That was
-    established by exact-slice comparison across two files (see the note in
-    _read_mask_from_syk), but it is the single most fragile assumption here — get it wrong
-    and every surface is misplaced — so it is re-tested on each import.  Sampling a handful
-    of block pairs costs well under a second.
+    The strides in _read_mask_from_syk (X: drop 3, Y/Z: drop 1) were derived from real
+    files, but they are the single most fragile assumption in this reader: get them wrong
+    and every surface is misplaced.  Sampling a few block pairs costs well under a second,
+    so it runs on every import and warns when the measurement disagrees.
     """
     try:
         measured = _measure_block_aprons(f, block_offset, cx, cy, cz, max_level,
-                                         block_payload)
+                                         block_payload,
+                                         max_pairs=None if verbose else _APRON_CHECK_PAIRS)
     except Exception as exc:
         _log(f"block-geometry self-check skipped ({exc})")
         return
 
-    dims = {"X": cx, "Y": cy, "Z": cz}
-    for name, m in measured.items():
-        if verbose:
-            _log(f"  block geometry {name}: {m['pairs']} usable pair(s) of "
-                 f"{m['examined']} examined; apron stride "
-                 f"{m['stride'] if m['stride'] is not None else 'none (blocks tile)'}")
-        if m["pairs"] == 0:
-            continue        # no painted boundary on this axis; no evidence either way
-        if m["stride"] is not None:
-            _warn(f"{name}: blocks SHARE an apron — slice {m['stride']} of each block is an "
-                  f"exact copy of its neighbour's first slice. This reader assumes they "
-                  f"tile at stride {dims[name]}, so the mask will be stretched along {name} "
-                  f"and duplicated at every block boundary. Please report this file.")
+    if verbose:
+        _log("APRON DIAGNOSTIC (aggregated over adjacent painted pairs):")
+        for name, m in measured.items():
+            _log(f"  {name}: high(A.last=B.first)={m['high']:.2f}  "
+                 f"low(A.first=prev.last)={m['low']:.2f}  base={m['base']:.2f}  "
+                 f"self(A.last=A.first)={m['self']:.2f}  "
+                 f"pairs={m['pairs']} vox={m['voxels']}")
+
+    # X drops 3 columns because its trailing columns are padding, not a shared apron;
+    # Y and Z drop 1 because their last slice IS the neighbour's first.
+    expect_shared_apron = {"X": False, "Y": True, "Z": True}
+    for name, expected in expect_shared_apron.items():
+        m = measured[name]
+        if not np.isfinite(m["high"]) or not np.isfinite(m["base"]):
+            continue        # nothing painted near a boundary on this axis; no evidence
+        observed = (m["high"] - m["base"]) > _APRON_MARGIN
+        if observed and not expected:
+            _warn(f"{name}: blocks appear to SHARE an apron (high={m['high']:.2f} vs "
+                  f"base={m['base']:.2f}), but this reader drops 3 {name} columns as "
+                  f"padding. Surfaces may be misaligned along {name}.")
+        elif expected and not observed:
+            _warn(f"{name}: blocks appear to ABUT (high={m['high']:.2f} vs "
+                  f"base={m['base']:.2f}), but this reader drops the last {name} slice as "
+                  f"a shared apron. Surfaces may be misaligned along {name}.")
+
+    x = measured["X"]
+    if np.isfinite(x["self"]) and x["self"] < 0.5 and x["voxels"] > 0:
+        _warn(f"X: the trailing columns do not look like copies of column 0 "
+              f"(self={x['self']:.2f}); the 3-column X drop is unverified for this file.")
 
 
 def _probe_seams(vol, ux, uy, uz, origin, n_probes=4, half=7):
