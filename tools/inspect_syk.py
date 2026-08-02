@@ -17,22 +17,59 @@ Answers two questions the XTension currently has to assume:
 Usage:
     python inspect_syk.py path/to/file.syk --ims-dims 2160 2560 1281
 
-Nothing is written and the file is only ever opened for reading, so this is safe
-to run against live data.  syGlass must not hold the file open (close the project
-first) or Windows will refuse the read.
+Standard library only — no numpy — so it runs under any Python 3, not just the
+interpreter Imaris is configured with.  Nothing is written and the file is only
+ever opened for reading, so this is safe to run against live data.  syGlass must
+not hold the file open (close the project first) or Windows will refuse the read.
 """
 
 from __future__ import annotations
 
 import argparse
 import struct
+import sys
+from array import array
 from collections import Counter
-
-import numpy as np
 
 HEADER_BYTES = 36
 BLOCK_HEADER_BYTES = 24
 FVGU = b"fvgu"
+
+
+def read_u16(data: bytes) -> array:
+    """Little-endian uint16 view of a block payload."""
+    a = array("H")
+    a.frombytes(data)
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a
+
+
+def take_slice(payload: array, cx: int, cy: int, cz: int, axis: int, j: int):
+    """
+    One slice of a (cz, cy, cx) C-ordered payload, perpendicular to `axis`,
+    where axis 2 = X, 1 = Y, 0 = Z.  Flat index is z*cy*cx + y*cx + x.
+    """
+    if axis == 2:                       # X: every cx-th element starting at j
+        return payload[j::cx]
+    if axis == 0:                       # Z: one contiguous plane
+        return payload[j * cy * cx:(j + 1) * cy * cx]
+    out = array("H")                    # Y: cz contiguous runs of cx
+    for z in range(cz):
+        base = z * cy * cx + j * cx
+        out.extend(payload[base:base + cx])
+    return out
+
+
+def agreement(sa, sb):
+    """(matching, considered) over voxels where either slice is painted."""
+    match = total = 0
+    for a, b in zip(sa, sb):
+        if a or b:
+            total += 1
+            if a == b:
+                match += 1
+    return match, total
 
 
 def block_level(block_id: int) -> int:
@@ -164,7 +201,7 @@ def main() -> int:
                 if len(cache) > 8:
                     cache.clear()
                 f.seek(offsets[bid] + BLOCK_HEADER_BYTES)
-                cache[bid] = np.frombuffer(f.read(payload), "<u2").reshape(cz, cy, cx)
+                cache[bid] = read_u16(f.read(payload))
             return cache[bid]
 
         # ---------------------------------------------------------------
@@ -178,12 +215,12 @@ def main() -> int:
         print("  'abut' = no j matches, so the stride is the full block dimension.\n")
 
         implied = {}
-        # payload is (cz, cy, cx): array axis 2 = X, 1 = Y, 0 = Z
+        # payload is (cz, cy, cx): axis 2 = X, 1 = Y, 0 = Z
         for arr_axis, name, dim, step in ((2, "X", cx, (1, 0, 0)),
                                           (1, "Y", cy, (0, 1, 0)),
                                           (0, "Z", cz, (0, 0, 1))):
-            agree = np.zeros(dim); total = np.zeros(dim)
-            self_agree = np.zeros(dim); self_total = np.zeros(dim)
+            agree = [0] * dim; total = [0] * dim
+            self_agree = [0] * dim; self_total = [0] * dim
             pairs = 0
             for pos, bid in leaves.items():
                 if pairs >= args.pairs:
@@ -192,16 +229,14 @@ def main() -> int:
                 if nb not in leaves:
                     continue
                 A, B = read_block(bid), read_block(leaves[nb])
-                b0 = np.take(B, 0, axis=arr_axis)
-                a0 = np.take(A, 0, axis=arr_axis)
+                b0 = take_slice(B, cx, cy, cz, arr_axis, 0)
+                a0 = take_slice(A, cx, cy, cz, arr_axis, 0)
                 for j in range(dim):
-                    aj = np.take(A, j, axis=arr_axis)
-                    m = (aj > 0) | (b0 > 0)
-                    if m.any():
-                        agree[j] += np.sum(aj[m] == b0[m]); total[j] += m.sum()
-                    ms = (aj > 0) | (a0 > 0)
-                    if ms.any():
-                        self_agree[j] += np.sum(aj[ms] == a0[ms]); self_total[j] += ms.sum()
+                    aj = take_slice(A, cx, cy, cz, arr_axis, j)
+                    m, t = agreement(aj, b0)
+                    agree[j] += m; total[j] += t
+                    m, t = agreement(aj, a0)
+                    self_agree[j] += m; self_total[j] += t
                 pairs += 1
 
             if pairs == 0:
@@ -209,10 +244,10 @@ def main() -> int:
                 implied[name] = None
                 continue
 
-            ratio = np.divide(agree, total, out=np.full(dim, np.nan), where=total > 0)
-            selfr = np.divide(self_agree, self_total, out=np.full(dim, np.nan),
-                              where=self_total > 0)
-            order = np.argsort(np.nan_to_num(ratio, nan=-1))[::-1][:4]
+            ratio = [(agree[j] / total[j]) if total[j] else -1.0 for j in range(dim)]
+            selfr = [(self_agree[j] / self_total[j]) if self_total[j] else -1.0
+                     for j in range(dim)]
+            order = sorted(range(dim), key=lambda j: ratio[j], reverse=True)[:4]
             print(f"  {name} (block dim {dim}, {pairs} pairs):")
             for j in order:
                 if total[j] == 0:
@@ -220,19 +255,19 @@ def main() -> int:
                 tag = ""
                 if j == dim - 1: tag = "  <- last slice (1-voxel apron)"
                 elif j == dim - 3: tag = "  <- what the code assumes for X"
-                print(f"      j={int(j):4d}  A[j]==B[0] in {ratio[j]:5.2f} of "
-                      f"{int(total[j]):8d} painted voxels{tag}")
-            best = int(order[0])
-            if np.nan_to_num(ratio[best], nan=0) > 0.80:
+                print(f"      j={j:4d}  A[j]==B[0] in {ratio[j]:5.2f} of "
+                      f"{total[j]:8d} painted voxels{tag}")
+            best = order[0]
+            if ratio[best] > 0.80:
                 implied[name] = best
                 print(f"      => stride = {best}  (= block dim {dim} minus "
                       f"{dim - best} apron voxel(s))")
             else:
                 implied[name] = dim
                 print(f"      => no slice matches; blocks ABUT, stride = {dim}")
-            sbest = int(np.argsort(np.nan_to_num(selfr, nan=-1))[::-1][0])
+            sbest = max(range(dim), key=lambda j: selfr[j])
             print(f"      (padding check: A[{sbest}] best matches A[0] at "
-                  f"{np.nan_to_num(selfr[sbest], nan=0):.2f})")
+                  f"{max(0.0, selfr[sbest]):.2f})")
 
         # ---------------------------------------------------------------
         print("\n" + "=" * 78)
