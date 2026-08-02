@@ -70,6 +70,8 @@ def main() -> int:
                     help="profiles to compare per candidate (default 300)")
     ap.add_argument("--parents", type=int, default=6,
                     help="parent blocks to use per axis (default 6)")
+    ap.add_argument("--dump", type=int, default=3,
+                    help="parent/reconstruction profiles to print for the winner")
     ap.add_argument("--scan-parents", type=int, default=40,
                     help="parent blocks to examine while hunting for painted ones")
     args = ap.parse_args()
@@ -139,59 +141,84 @@ def main() -> int:
                 print("    no parent with both children present; cannot measure\n")
                 continue
 
-            results = []
-            for s in range(dim - args.span, dim + 1):
+            # Three plausible ways syGlass might collapse 2x2x2 voxels into one parent
+            # voxel.  The right one is unknown, and assuming wrongly adds noise at every
+            # stride, which flattens the curve and hides the answer.
+            RULES = {
+                "max":   lambda vs: max(vs),
+                "first": lambda vs: vs[0],
+                "minnz": lambda vs: min([v for v in vs if v], default=0),
+            }
+
+            def compare(s, rule, collect=0):
+                """(match, total, samples, mismatch histogram) at this stride and rule."""
+                fn = RULES[rule]
                 match = total = 0
+                samples = []
+                hist = {}
                 for pid, lo_id, hi_id in usable:
                     P = read_block(pid)
                     A = read_block(lo_id)
                     B = read_block(hi_id)
                     done = 0
-                    # Transverse samples inside the lower child, so no transverse child
-                    # boundary complicates the mapping.  The bounds come from the two
-                    # TRANSVERSE dimensions, not from `dim` — for the X axis the
-                    # transverse coordinates index Y and Z, which have their own sizes.
                     step = max(1, (min(dim_a, dim_b) // 2) // 12)
                     for j in range(0, (dim_a - 1) // 2, step):
                         for k in range(0, (dim_b - 1) // 2, step):
                             if done >= args.lines:
                                 break
                             pl_ = line(P, cx, cy, cz, axis, j, k)
-                            # eight level-L voxels collapse into one parent voxel; take
-                            # the max, the usual choice for a label pyramid
-                            a0 = line(A, cx, cy, cz, axis, 2 * j, 2 * k)
-                            a1 = line(A, cx, cy, cz, axis, 2 * j + 1, 2 * k)
-                            a2 = line(A, cx, cy, cz, axis, 2 * j, 2 * k + 1)
-                            a3 = line(A, cx, cy, cz, axis, 2 * j + 1, 2 * k + 1)
-                            b0 = line(B, cx, cy, cz, axis, 2 * j, 2 * k)
-                            b1 = line(B, cx, cy, cz, axis, 2 * j + 1, 2 * k)
-                            b2 = line(B, cx, cy, cz, axis, 2 * j, 2 * k + 1)
-                            b3 = line(B, cx, cy, cz, axis, 2 * j + 1, 2 * k + 1)
+                            a = [line(A, cx, cy, cz, axis, 2*j + dj, 2*k + dk)
+                                 for dj in (0, 1) for dk in (0, 1)]
+                            b = [line(B, cx, cy, cz, axis, 2*j + dj, 2*k + dk)
+                                 for dj in (0, 1) for dk in (0, 1)]
 
                             def recon(x):
                                 if x < s:
-                                    return max(a0[x], a1[x], a2[x], a3[x])
+                                    return fn([ln[x] for ln in a])
                                 x -= s
                                 if x >= dim:
                                     return 0
-                                return max(b0[x], b1[x], b2[x], b3[x])
+                                return fn([ln[x] for ln in b])
 
-                            # The parent's unique content [0, s) spans level-L voxels
-                            # [0, 2s) — i.e. ALL of child A's unique region and all of
-                            # child B's.  Covering only [0, s//2) would never consult B
-                            # and so could not test the stride at all.
+                            prof_p, prof_r = [], []
                             for i in range(s):
                                 pv = pl_[i]
-                                cv = max(recon(2 * i), recon(2 * i + 1))
+                                cv = fn([recon(2*i), recon(2*i + 1)])
+                                if collect and len(samples) < collect:
+                                    prof_p.append(pv)
+                                    prof_r.append(cv)
                                 if pv or cv:
                                     total += 1
                                     if pv == cv:
                                         match += 1
+                                    else:
+                                        key = (pv, cv)
+                                        hist[key] = hist.get(key, 0) + 1
+                            if collect and len(samples) < collect and any(prof_p + prof_r):
+                                samples.append((pid, j, k, prof_p, prof_r))
                             done += 1
                         if done >= args.lines:
                             break
-                r = (match / total) if total else float("nan")
-                results.append((s, r, total))
+                return match, total, samples, hist
+
+            # pick the downsample rule that explains the data best at any stride
+            rule_best = {}
+            for rule in RULES:
+                sc = []
+                for s in range(dim - args.span, dim + 1):
+                    m, t, _, _ = compare(s, rule)
+                    sc.append(((m / t) if t else float("nan"), s, t))
+                rule_best[rule] = max(sc, key=lambda x: (x[0] if x[0] == x[0] else -1))
+            rule = max(rule_best, key=lambda r: (rule_best[r][0]
+                                                 if rule_best[r][0] == rule_best[r][0] else -1))
+            print("    downsample rule fit: " + "   ".join(
+                f"{r}={rule_best[r][0]:.4f}@{rule_best[r][1]}" for r in RULES)
+                + f"    -> using '{rule}'")
+
+            results = []
+            for s in range(dim - args.span, dim + 1):
+                m, t, _, _ = compare(s, rule)
+                results.append((s, (m / t) if t else float("nan"), t))
 
             # A small stride compares fewer voxels, so it can score 1.0 on a handful of
             # them by luck.  Only trust candidates backed by a decent share of the
@@ -214,7 +241,27 @@ def main() -> int:
                 print(f"    {s:7d} {rs:>13s} {t:10d}{mark}")
             if best:
                 print(f"    => stride {best[0]} reproduces the parent best "
-                      f"({best[1]:.4f} over {best[2]} voxels)\n")
+                      f"({best[1]:.4f} over {best[2]} voxels)")
+                # Show WHERE it disagrees.  A low score can mean the stride is wrong, but
+                # it can equally mean the parent is not the 2x downsample we assume, and
+                # those look completely different in the mismatch histogram.
+                _m, _t, samples, hist = compare(best[0], rule, collect=args.dump)
+                if hist:
+                    top = sorted(hist.items(), key=lambda kv: -kv[1])[:6]
+                    print("       most common (parent, reconstructed) mismatches: "
+                          + ", ".join(f"({a},{b})x{n}" for (a, b), n in top))
+                    zero_p = sum(n for (a, b), n in hist.items() if a == 0)
+                    zero_r = sum(n for (a, b), n in hist.items() if b == 0)
+                    print(f"       of {sum(hist.values())} mismatches: "
+                          f"{zero_p} have parent EMPTY, {zero_r} have reconstruction EMPTY")
+                for pid, j, k, pp, rr in samples:
+                    def render(v):
+                        return "".join("." if x == 0 else (str(x) if x < 10 else "#")
+                                       for x in v)
+                    print(f"       parent {pid} line (j={j},k={k})")
+                    print(f"         parent: {render(pp)[:110]}")
+                    print(f"         recon : {render(rr)[:110]}")
+                print()
             else:
                 print("    => not enough evidence on this axis\n")
     return 0
