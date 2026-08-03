@@ -16,9 +16,10 @@ Masks:
   1. Parse the .syk octree directly, rather than using the `syglass` Python API (which
      has proven to be more trouble than it seems like it would be).  Block headers are
      scanned to inventory the octree; the root block (a whole-volume preview downsampled
-     by 2**max_level) gives a cheap bounding-box estimate; only the deepest-level blocks
-     inside that box are then read and composited.  Blocks are stored (CZ, CY, CX) and
-     overlap their neighbours — see _read_mask_from_syk for the per-axis geometry.
+     by 2**max_level) gives a cheap bounding-box estimate; the LEAF blocks inside that box
+     — those with no stored children, which may sit above the deepest level — are then
+     read and composited.  Blocks are stored (CZ, CY, CX) and overlap their neighbours;
+     see _DEFAULT_TRIM for the per-axis overlap.
   2. For each label, build a signed uint8 field cropped to that label's bounding box
      (sigma <= 0: binary 100=inside / 200=outside; sigma > 0: a clipped Gaussian
      gradient), and upload it in bands via SetDataSubVolumeAs1DArrayBytes, each call
@@ -78,14 +79,32 @@ import ImarisLib  # type: ignore  # noqa: E402
 # Tunables
 # -----------------------------------------------------------------------
 
+# Magic at the start of every .syk block record.
+_FVGU = b"fvgu"
+
 # Largest payload (bytes) to push in a single COM call.  Ice's default MessageSizeMax
 # is ~1 MB; staying under it lets us upload a band of z-slices per call.
 _ICE_CHUNK_BYTES = 900_000
 
-# syGlass label IDs are generally small.  Anything above this is probably storage artifact rather than a
-# painted label — see the padding-column note in _read_mask_from_syk — and is erased at
-# read time so it cannot punch holes in a neighbouring label's surface.
+# syGlass label IDs are generally small.  Anything above this is probably a storage
+# artifact rather than a painted label, and is erased at read time so it cannot show up as
+# a phantom surface.
 _MAX_PLAUSIBLE_LABEL = 100
+
+# Voxels dropped from the trailing edge of each block per axis, i.e. block_dim - stride.
+#
+# Established by rendering real files and looking at the result, which is the only test
+# that proved reliable: (3,1,1) and (2,1,1) both produce clean surfaces, while (0,0,0)
+# reproduces the periodic displaced-slice artifact.  So blocks DO overlap their neighbours,
+# by 1 voxel in Y and Z and by 2-3 in X; X's exact value is not resolved because a
+# one-voxel difference in 133 is not visible.
+#
+# Note the syGlass grid does not have to align with the .ims voxel grid — the mask is
+# scaled onto the .ims extents — so a grid slightly smaller than the image is expected and
+# is NOT evidence that these numbers are wrong.  Several attempts to infer them from file
+# structure went astray on exactly that assumption.  The options menu exposes them for
+# testing against a new file.
+_DEFAULT_TRIM = (3, 1, 1)
 
 # Extra root-level blocks of margin on each side of the estimated mask bounding box.
 _ROOT_BBOX_MARGIN_BLOCKS = 2
@@ -540,7 +559,7 @@ def _import_counting_points(factory, scene, sym_path: str, geom: _Geometry,
 # -----------------------------------------------------------------------
 
 def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
-                        trim=(3, 1, 1)):
+                        trim=_DEFAULT_TRIM):
     """
     Read the syGlass label mask from a .syk file.
 
@@ -553,7 +572,6 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
       clip_info = (vx0, vy0, vz0, full_nx, full_ny, full_nz)
     or (None, None) on failure.
     """
-    FVGU = b"fvgu"
     try:
         syk_size = os.path.getsize(syk_path)
         with open(syk_path, "rb") as f:
@@ -569,33 +587,17 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: cx={cx} cy={cy} cz={cz}  "
                  f"stride={block_stride:,}  ~{n_blocks_est} blocks")
 
-            # Pass 1 — read all block headers (no payload) to inventory IDs
-            block_offset = {}   # block_id → file offset
-            off = 36
-            for _ in range(n_blocks_est):
-                f.seek(off)
-                hdr = f.read(24)
-                if len(hdr) < 24 or hdr[0:4] != FVGU:
-                    break
-                pl_size, bid, _lod, _flags = struct.unpack("<QIII", hdr[4:])
-                if pl_size == block_payload:
-                    block_offset[bid] = off
-                off += block_stride
-
+            block_offset = _scan_block_headers(f, n_blocks_est, block_stride, block_payload)
             if not block_offset:
                 _log(".syk: no valid blocks found")
                 return None, None
 
             max_level = max(_syk_block_level(bid) for bid in block_offset)
             n_grid    = 2 ** max_level
-            # Per-axis block geometry (measured from real .syk).  X (the fastest-stored
-            # axis) carries a 1-voxel apron PLUS 2 trailing PADDING columns that copy the
-            # block's own column 0 (the 18024/30825 sentinels are these).  Placing them
-            # injects a ghost plane one block-width away in X — so drop X's apron + 2
-            # padding (last 3).  Y and Z carry only a 1-voxel apron (drop last 1).
-            # ax/ay/az = unique voxels kept per block per axis (= placement size = stride).
-            # See _DEFAULT_TRIM for how these were established and why the syGlass grid
-            # need not match the .ims voxel grid.
+            # ax/ay/az = voxels kept per block per axis, which is also the placement
+            # stride: blocks overlap their neighbours by `trim` voxels and the trailing
+            # ones are discarded.  See _DEFAULT_TRIM for how the values were established
+            # and what is still unknown about them.
             tx, ty, tz = (int(v) for v in trim)
             ax, ay, az = cx - tx, cy - ty, cz - tz
             if min(ax, ay, az) < 1:
@@ -606,26 +608,9 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: {len(block_offset)} blocks; "
                  f"deepest level={max_level}  full grid={full_nx}×{full_ny}×{full_nz}")
 
-
-            # Read root block to estimate mask bbox in root voxels, then scale up.
-            # Use the full cx×cy×cz root block (ghost slices are fine here — they
-            # just slightly widen the bbox estimate, which is conservative).
-            bbox_x0, bbox_y0, bbox_z0 = 0, 0, 0
-            bbox_x1, bbox_y1, bbox_z1 = full_nx, full_ny, full_nz
-            if 0 in block_offset:
-                f.seek(block_offset[0] + 24)
-                raw_root = f.read(block_payload)
-                root_arr = (np.frombuffer(raw_root, dtype="<u2")
-                            .reshape(cz, cy, cx).transpose(2, 1, 0))
-                nz_r = np.where(root_arr > 0)
-                if len(nz_r[0]) > 0:
-                    m = _ROOT_BBOX_MARGIN_BLOCKS
-                    bbox_x0 = max(0,       (int(nz_r[0].min()) - m) * n_grid)
-                    bbox_x1 = min(full_nx, (int(nz_r[0].max()) + m + 1) * n_grid)
-                    bbox_y0 = max(0,       (int(nz_r[1].min()) - m) * n_grid)
-                    bbox_y1 = min(full_ny, (int(nz_r[1].max()) + m + 1) * n_grid)
-                    bbox_z0 = max(0,       (int(nz_r[2].min()) - m) * n_grid)
-                    bbox_z1 = min(full_nz, (int(nz_r[2].max()) + m + 1) * n_grid)
+            bbox = _estimate_bbox(f, block_offset, (cx, cy, cz), block_payload,
+                                  n_grid, (full_nx, full_ny, full_nz))
+            (bbox_x0, bbox_y0, bbox_z0), (bbox_x1, bbox_y1, bbox_z1) = bbox
 
         clip_nx = bbox_x1 - bbox_x0
         clip_ny = bbox_y1 - bbox_y0
@@ -663,11 +648,13 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
                     continue                      # interior node: its children hold the data
                 lv, ix, iy, iz = _syk_block_position(bid)
                 scale = 1 << (max_level - lv)     # finest voxels per voxel of this block
-                sx, sy, sz = ax * scale, ay * scale, az * scale   # span in finest voxels
+                span_x = ax * scale      # extent of this block in finest-grid voxels
+                span_y = ay * scale
+                span_z = az * scale
 
-                bx0, bx1 = ix * sx, ix * sx + sx
-                by0, by1 = iy * sy, iy * sy + sy
-                bz0, bz1 = iz * sz, iz * sz + sz
+                bx0, bx1 = ix * span_x, ix * span_x + span_x
+                by0, by1 = iy * span_y, iy * span_y + span_y
+                bz0, bz1 = iz * span_z, iz * span_z + span_z
 
                 if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
                 if by1 <= bbox_y0 or by0 >= bbox_y1: continue
@@ -684,23 +671,24 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
                 if scale > 1:
                     arr = arr.repeat(scale, 0).repeat(scale, 1).repeat(scale, 2)
 
-                cx0 = max(0, bbox_x0 - bx0);  cx1 = min(sx, bbox_x1 - bx0)
-                cy0 = max(0, bbox_y0 - by0);  cy1 = min(sy, bbox_y1 - by0)
-                cz0 = max(0, bbox_z0 - bz0);  cz1 = min(sz, bbox_z1 - bz0)
+                # Sub-range of this block that falls inside the clipped volume, and where
+                # it lands.  Named src_/dst_ rather than c*/d* because cx, cy, cz are the
+                # block dimensions and in scope here.
+                src_x0 = max(0, bbox_x0 - bx0);  src_x1 = min(span_x, bbox_x1 - bx0)
+                src_y0 = max(0, bbox_y0 - by0);  src_y1 = min(span_y, bbox_y1 - by0)
+                src_z0 = max(0, bbox_z0 - bz0);  src_z1 = min(span_z, bbox_z1 - bz0)
 
-                dx0 = bx0 + cx0 - bbox_x0;  dx1 = dx0 + (cx1 - cx0)
-                dy0 = by0 + cy0 - bbox_y0;  dy1 = dy0 + (cy1 - cy0)
-                dz0 = bz0 + cz0 - bbox_z0;  dz1 = dz0 + (cz1 - cz0)
+                dst_x0 = bx0 + src_x0 - bbox_x0;  dst_x1 = dst_x0 + (src_x1 - src_x0)
+                dst_y0 = by0 + src_y0 - bbox_y0;  dst_y1 = dst_y0 + (src_y1 - src_y0)
+                dst_z0 = bz0 + src_z0 - bbox_z0;  dst_z1 = dst_z0 + (src_z1 - src_z0)
 
-                dst = vol[dx0:dx1, dy0:dy1, dz0:dz1]     # view into vol
-                dst[...] = arr[cx0:cx1, cy0:cy1, cz0:cz1]
+                dst = vol[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1]   # view into vol
+                dst[...] = arr[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
 
-                # Erase storage sentinels (18024/30825 and friends) as each block lands.
-                # With the strides above they are sliced off before placement, so this
-                # should find nothing; it costs one pass over a 6 MB block and keeps a
-                # phantom "label 18024" out of the inventory if a file ever slips one
-                # through.  A sentinel reads as "not this label" whether it is erased or
-                # left in place, so this neither creates nor closes a hole.
+                # Erase implausible label IDs as each block lands.  Cheap (one pass over a
+                # block-sized view) and it keeps a phantom "label 18024" out of the
+                # inventory.  A sentinel reads as "not this label" whether erased or left
+                # in place, so this neither creates nor closes a hole in any surface.
                 bad = dst > _MAX_PLAUSIBLE_LABEL
                 n_bad = int(bad.sum())
                 if n_bad:
@@ -720,11 +708,12 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
 
-        # No seam-filling pass: with correct per-axis strides the blocks join exactly, and
-        # a whole-volume repair scan cost ~20s and tens of GB to patch nothing.  If a file
-        # ever does show 1-voxel gaps at block boundaries, the block trim is wrong for it —
-        # try adjusting it in the options menu, and turn on troubleshooting to see the seam
-        # probe below.  Fix the geometry rather than papering over it here.
+        # There is no seam-filling pass.  An earlier version scanned the whole volume for
+        # 1-voxel gaps and patched them, at a measured cost of ~20 s and tens of GB of
+        # temporaries; with a correct trim the blocks join without gaps, so it was removed
+        # rather than kept as insurance.  If a file does show gaps at block boundaries the
+        # trim is likely wrong for it — adjust it in the options menu, and turn on
+        # troubleshooting for the seam probe below.
         #
         # Troubleshooting only: value profile across block boundaries (should read '1111|1111').
         if diagnostics:
@@ -740,6 +729,61 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
     except Exception:
         _log(f".syk parse failed:\n{traceback.format_exc()}")
         return None, None
+
+
+def _scan_block_headers(f, n_blocks, block_stride: int, block_payload: int) -> dict:
+    """
+    Walk the fixed-stride block records and return {block_id: file offset}.
+
+    Only headers are read, never payloads, so this is cheap even on a multi-GB file.
+    Records whose declared payload size disagrees with the header geometry are skipped,
+    and the walk stops at the first record without the 'fvgu' magic — which is also how
+    the trailing INDX footer terminates the scan.
+    """
+    block_offset = {}
+    off = 36
+    for _ in range(n_blocks):
+        f.seek(off)
+        hdr = f.read(24)
+        if len(hdr) < 24 or hdr[0:4] != _FVGU:
+            break
+        pl_size, bid, _lod, _flags = struct.unpack("<QIII", hdr[4:])
+        if pl_size == block_payload:
+            block_offset[bid] = off
+        off += block_stride
+    return block_offset
+
+
+def _estimate_bbox(f, block_offset: dict, block_dims, block_payload: int,
+                   n_grid: int, full_grid):
+    """
+    Bounding box of the painted region, in finest-grid voxels, from the root block alone.
+
+    The root is a whole-volume preview, so a single small read tells us which part of the
+    (potentially billions of voxels) full grid is worth allocating.  The whole block is
+    used, overlap included: that can only widen the estimate, and a generous bbox is
+    harmless.  Falls back to the full grid when there is no root block.
+
+    Returns ((x0, y0, z0), (x1, y1, z1)).
+    """
+    cx, cy, cz = block_dims
+    full_nx, full_ny, full_nz = full_grid
+    if 0 not in block_offset:
+        return (0, 0, 0), (full_nx, full_ny, full_nz)
+
+    f.seek(block_offset[0] + 24)
+    root = (np.frombuffer(f.read(block_payload), dtype="<u2")
+            .reshape(cz, cy, cx).transpose(2, 1, 0))
+    nz = np.where(root > 0)
+    if len(nz[0]) == 0:
+        return (0, 0, 0), (full_nx, full_ny, full_nz)
+
+    m = _ROOT_BBOX_MARGIN_BLOCKS
+    lo, hi = [], []
+    for idx, full in zip(nz, (full_nx, full_ny, full_nz)):
+        lo.append(max(0, (int(idx.min()) - m) * n_grid))
+        hi.append(min(full, (int(idx.max()) + m + 1) * n_grid))
+    return tuple(lo), tuple(hi)
 
 
 def _syk_block_level(block_id: int) -> int:
@@ -1159,21 +1203,6 @@ def _ask_for_syk(initialdir: str) -> str | None:
 # Options menu
 # -----------------------------------------------------------------------
 
-# Voxels dropped from the trailing edge of each block per axis, i.e. block_dim - stride.
-#
-# Established by rendering real files and looking at the result, which is the only test
-# that proved reliable: (3,1,1) and (2,1,1) both produce clean surfaces, while (0,0,0)
-# reproduces the periodic displaced-slice artifact.  So blocks DO overlap their neighbours,
-# by 1 voxel in Y and Z and by 2-3 in X; X's exact value is not resolved because a
-# one-voxel difference in 133 is not visible.
-#
-# Note the syGlass grid does not have to align with the .ims voxel grid — the mask is
-# scaled onto the .ims extents — so a grid slightly smaller than the image is expected and
-# is NOT evidence that these numbers are wrong.  Several attempts to infer them from file
-# structure went astray on exactly that assumption.  The options menu exposes them for
-# testing against a new file.
-_DEFAULT_TRIM = (3, 1, 1)
-
 # Surface-smoothing presets: label → Gaussian blur sigma (voxels).  0 = raw voxel fidelity.
 _SMOOTHING_LEVELS = [
     ("None — voxel fidelity (blocky)", 0.0),
@@ -1200,19 +1229,35 @@ def _ask_settings() -> dict | None:
                 "trim": tuple(cfg.get("trim", _DEFAULT_TRIM))}
     try:
         import tkinter as tk
+        from tkinter import ttk
         root = tk.Tk()
         root.title("syGlass → Imaris — options")
         root.attributes("-topmost", True)
 
-        tk.Label(root, text="Surface smoothing (Gaussian blur — smoother = less voxel detail):",
-                 anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        # Two tabs.  Everything a normal import needs is on the first; the second holds
+        # settings that are either diagnostic or not trustworthy yet, so they stay out of
+        # the way instead of inviting people to change things they shouldn't.
+        tabs = ttk.Notebook(root)
+        basic = tk.Frame(tabs)
+        advanced = tk.Frame(tabs)
+        tabs.add(basic, text="  Import  ")
+        tabs.add(advanced, text="  Advanced  ")
+        tabs.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # ---- Import tab: surface smoothing only ----------------------------
+        tk.Label(basic, text="Surface smoothing", font=("", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(basic, text="Gaussian blur applied before meshing. Smoother surfaces show "
+                            "less voxel detail.",
+                 anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
+                                                                  pady=(0, 6))
         preset_vals = [v for _, v in _SMOOTHING_LEVELS]
         is_preset = defaults["sigma"] in preset_vals
         # A saved custom sigma leaves every radio unselected (-1 matches no preset) and
         # prefills the custom box, so the dialog shows what will actually be used.
         sigma_var = tk.DoubleVar(value=defaults["sigma"] if is_preset else -1.0)
 
-        crow = tk.Frame(root)
+        crow = tk.Frame(basic)
         custom = tk.Entry(crow, width=8)
 
         def _clear_custom():
@@ -1220,48 +1265,57 @@ def _ask_settings() -> dict | None:
             custom.delete(0, "end")
 
         for name, val in _SMOOTHING_LEVELS:
-            tk.Radiobutton(root, text=name, variable=sigma_var, value=val, anchor="w",
+            tk.Radiobutton(basic, text=name, variable=sigma_var, value=val, anchor="w",
                            command=_clear_custom).pack(fill="x", padx=26)
 
-        crow.pack(fill="x", padx=26, pady=(4, 2))
+        crow.pack(fill="x", padx=26, pady=(4, 12))
         tk.Label(crow, text="…or custom blur:").pack(side="left")
         custom.pack(side="left", padx=6)
         if not is_preset:
             custom.insert(0, str(defaults["sigma"]))
 
+        # ---- Advanced tab: diagnostics, experimental, block geometry -------
         diag_var = tk.BooleanVar(value=defaults["diagnostics"])
-        tk.Checkbutton(root, text="Troubleshooting: log block diagnostics + mask preview",
+        tk.Checkbutton(advanced, text="Troubleshooting: log block diagnostics + mask preview",
                        variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 2))
 
-        tk.Label(root, text="Advanced — block trim X,Y,Z (voxels dropped from each block "
-                            "edge):", anchor="w").pack(fill="x", padx=14, pady=(12, 2))
-        trim_entry = tk.Entry(root, width=12)
-        trim_entry.insert(0, ",".join(str(v) for v in defaults["trim"]))
-        trim_entry.pack(anchor="w", padx=26)
-        tk.Label(root, text=f"(default {','.join(str(v) for v in _DEFAULT_TRIM)}; change "
-                            f"only to diagnose block-boundary artifacts)",
-                 anchor="w", fg="grey").pack(fill="x", padx=26)
-
         spots_var = tk.BooleanVar(value=defaults["spots"])
-        tk.Checkbutton(root, text="EXPERIMENTAL: import .sym counting points (positions unverified)",
-                       variable=spots_var, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
+        tk.Checkbutton(advanced,
+                       text="Import .sym counting points (EXPERIMENTAL — untested, "
+                            "positions unverified)",
+                       variable=spots_var, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+
+        tk.Label(advanced, text="Block trim X,Y,Z", font=("", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(6, 0))
+        tk.Label(advanced,
+                 text="Voxels dropped from each block edge, because blocks overlap their "
+                      "neighbours. Only change this to diagnose a repeating artifact at "
+                      "block boundaries.",
+                 anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
+                                                                  pady=(0, 6))
+        trow = tk.Frame(advanced); trow.pack(fill="x", padx=26, pady=(0, 12))
+        trim_entry = tk.Entry(trow, width=12)
+        trim_entry.insert(0, ",".join(str(v) for v in defaults["trim"]))
+        trim_entry.pack(side="left")
+        tk.Label(trow, text=f"  (default {','.join(str(v) for v in _DEFAULT_TRIM)})",
+                 fg="grey").pack(side="left")
 
         out = {}
         state = {"cancelled": False}
 
         def _ok():
-            s = float(sigma_var.get())
+            s_val = float(sigma_var.get())
             c = custom.get().strip()
             if c:
                 try:
-                    s = float(c)
+                    s_val = float(c)
                 except ValueError:
                     pass
-            out["sigma"] = max(0.0, s)
+            out["sigma"] = max(0.0, s_val)
             out["diagnostics"] = bool(diag_var.get())
             out["spots"] = bool(spots_var.get())
             try:
-                parts = [int(p) for p in trim_entry.get().replace(" ", "").split(",")]
+                parts = [int(v) for v in trim_entry.get().replace(" ", "").split(",")]
                 out["trim"] = tuple(parts) if len(parts) == 3 else defaults["trim"]
             except ValueError:
                 out["trim"] = defaults["trim"]
@@ -1271,7 +1325,7 @@ def _ask_settings() -> dict | None:
             state["cancelled"] = True
             root.quit()
 
-        brow = tk.Frame(root); brow.pack(pady=12)
+        brow = tk.Frame(root); brow.pack(pady=(0, 12))
         tk.Button(brow, text="Run", width=12, command=_ok).pack(side="left", padx=6)
         tk.Button(brow, text="Cancel", width=12, command=_cancel).pack(side="left", padx=6)
         root.protocol("WM_DELETE_WINDOW", _cancel)
