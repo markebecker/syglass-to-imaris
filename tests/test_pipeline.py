@@ -119,6 +119,31 @@ def test_extents(chk) -> None:
         np.allclose(lo3, g.ext_min) and np.allclose(hi3, g.ext_max))
 
 
+def test_field_extents(chk) -> None:
+    """
+    AddSurface spaces samples over (size - 1) intervals with samples ON the extent
+    borders, so the extents handed to Imaris must be inset by half a voxel; the invariant
+    is that Imaris's resulting sample spacing equals the true voxel size.
+    """
+    ds_lo = np.zeros(3)
+    per = np.ones(3)
+    offset, crop = np.array([10, 20, 30]), np.array([5, 7, 9])
+    lo, hi = XT._field_extents(ds_lo, per, offset, crop)
+    chk("field extents start half a voxel inside the crop edge",
+        np.allclose(lo, offset + 0.5), f"(got {lo})")
+    chk("field extents give Imaris a sample spacing of one voxel",
+        np.allclose((hi - lo) / (crop - 1), per))
+
+    per = np.array([0.5, 2.0, 3.25])
+    ds_lo = np.array([-100.0, 40.0, 7.5])
+    lo, hi = XT._field_extents(ds_lo, per, offset, crop)
+    chk("field extents: anisotropic spacing equals per-voxel exactly",
+        np.allclose((hi - lo) / (crop - 1), per))
+    chk("field extents sit inside the crop's outer edges",
+        np.all(lo > ds_lo + offset * per) and
+        np.all(hi < ds_lo + (offset + crop) * per))
+
+
 def test_smoothing(chk) -> None:
     """
     The fallback smoother must not erode the array edge, and must put the 0.5 crossing —
@@ -182,6 +207,7 @@ def main() -> int:
     test_upload(chk)
     test_inventory(chk)
     test_extents(chk)
+    test_field_extents(chk)
     test_smoothing(chk)
     test_octree_maths(chk)
     test_prep_label(chk)

@@ -392,6 +392,26 @@ def _clip_extents(geom: _Geometry, clip_info, vol_shape):
     return lo, hi, full
 
 
+def _field_extents(ds_lo, per_voxel, offset, crop):
+    """
+    Physical extents (µm) to set on a crop's IDataSet so AddSurface lands the field
+    exactly on the voxel grid.
+
+    AddSurface places field samples AT the extent borders: sample i sits at
+    extMin + i·(extMax − extMin)/(size − 1)  (ISurfaces::AddSurface: "voxel size is
+    (mExtentMax - mExtentMin) / (mSize - 1)").  Field sample i holds the value at the
+    CENTER of voxel i, i.e. at lo_edge + (i + 0.5)·per_voxel, so each extent is inset by
+    half a voxel to make the two agree, giving a sample spacing of exactly per_voxel.
+    Using the raw outer edges instead stretches the surface by size/(size−1) and shifts
+    it half a voxel — worst on small crops, and different for every crop size.
+    """
+    offset = np.asarray(offset, dtype=np.float64)
+    crop = np.asarray(crop, dtype=np.float64)
+    lo_edge = ds_lo + offset * per_voxel
+    hi_edge = ds_lo + (offset + crop) * per_voxel
+    return lo_edge + 0.5 * per_voxel, hi_edge - 0.5 * per_voxel
+
+
 def _inventory_labels(label_vol: np.ndarray):
     """
     Count voxels per label ID in one pass.
@@ -512,8 +532,7 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             prog.begin_label(label_idx, _upload_ticks(*crop))
 
             # Physical extents of this label's crop (sub-region of the clip volume).
-            lo = ds_lo + np.asarray(offset) * per_voxel
-            hi = ds_lo + (np.asarray(offset) + crop) * per_voxel
+            lo, hi = _field_extents(ds_lo, per_voxel, offset, crop)
             _log(f"{tag}: crop {crop[0]}x{crop[1]}x{crop[2]} "
                  f"({crop.prod() / 1e6:.1f} MB) at voxel "
                  f"({offset[0]},{offset[1]},{offset[2]}); painted={n_painted} kept={n_kept}; "
