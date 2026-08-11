@@ -1058,6 +1058,11 @@ def _upload_bands(nx: int, ny: int, nz: int, budget: int | None = None):
 
     `budget` defaults to _ICE_CHUNK_BYTES read at call time, not import time, so the
     constant stays adjustable.
+
+    Bands are never split along X, so one X row (nx bytes for a uint8 field) is the finest
+    granularity and a budget smaller than that cannot be honoured.  Reaching it would take
+    a crop wider than _ICE_CHUNK_BYTES voxels; no such file has come up so far, so the case
+    is left unhandled rather than guarded against.
     """
     if budget is None:
         budget = _ICE_CHUNK_BYTES
