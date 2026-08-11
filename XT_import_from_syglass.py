@@ -1575,25 +1575,39 @@ def _ask_settings() -> dict | None:
         state = {"cancelled": False}
 
         def _ok():
+            # Invalid input pops an error and leaves the dialog open for correction —
+            # silently reverting to a default would let the user believe they tested a
+            # value they did not test.
+            from tkinter import messagebox
+
+            def _bad(text):
+                messagebox.showerror("Import from syGlass", text, parent=root)
+
             s_val = float(sigma_var.get())
             c = custom.get().strip()
             if c:
                 try:
                     s_val = float(c)
                 except ValueError:
-                    pass
-            out["sigma"] = max(0.0, s_val)
+                    _bad(f"Custom blur must be a number (got {c!r}).")
+                    return
             try:
-                out["min_voxels"] = max(0, int(minvox_entry.get().strip() or 0))
+                mv = int(minvox_entry.get().strip() or 0)
             except ValueError:
-                out["min_voxels"] = defaults["min_voxels"]
-            out["diagnostics"] = bool(diag_var.get())
-            out["spots"] = bool(spots_var.get())
+                _bad("Minimum object size must be a whole number of voxels, e.g. 50.")
+                return
             try:
                 parts = [int(v) for v in trim_entry.get().replace(" ", "").split(",")]
-                out["trim"] = tuple(parts) if len(parts) == 3 else defaults["trim"]
+                if len(parts) != 3:
+                    raise ValueError
             except ValueError:
-                out["trim"] = defaults["trim"]
+                _bad("Block trim must be three integers separated by commas, e.g. 3,1,1.")
+                return
+            out["sigma"] = max(0.0, s_val)
+            out["min_voxels"] = max(0, mv)
+            out["diagnostics"] = bool(diag_var.get())
+            out["spots"] = bool(spots_var.get())
+            out["trim"] = tuple(parts)
             root.quit()
 
         def _cancel():
