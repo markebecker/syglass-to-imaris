@@ -7,7 +7,7 @@ Currently:
 * Imaris -> syGlass works natively for points (counting points in syGlass)
 
 Future Development:
-* Testing syGlass -> Imaris counting points
+* syGlass -> Imaris counting points. (An experimental reader existed but neither the `.sym` record layout nor the coordinate transform could be confirmed, so it was removed — see git history.)
 * syGlass plugin to port Imaris surfaces (or other surfaces...) into syGlass projects.
   * Imaris surface decoding to binary works, but directly making ROI(s) and mask objects via syGlass API has been problematic, particularly for Imaris-based projects (ie .ims + .syk)
 
@@ -20,7 +20,6 @@ Installation:
 Dependencies:
 * `numpy` — required.
 * `scipy` — optional. Used for surface smoothing and connected-component labeling; without it built-in fallbacks are used instead.
-* `leveldb` — optional, and only for the experimental counting-point import. Not needed for masks.
 
 Usage:
 1. Open the `.ims` in Imaris and run Extensions → Import from syGlass.
@@ -31,7 +30,7 @@ Usage:
 
 Known limitations:
 * **Single timepoint.** Masks are imported onto t=0, so only the first timepoint of a time series receives surfaces. Multi-channel files are fine.
-* **Counting-point import is experimental** and off by default. The `.sym` record layout and the syGlass → Imaris coordinate transform are both unconfirmed, so imported point positions should not be trusted. The checkbox exists to help work the format out.
+* **Counting points are not imported** — only masks. (See Future Development.)
 * Block geometry within the `.syk` was reverse-engineered from real files. The XTension re-measures it on every import and writes a warning to the log if the file disagrees — if you see one, check the resulting surfaces carefully before using them.
 
 Troubleshooting:

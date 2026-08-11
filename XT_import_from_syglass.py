@@ -1,5 +1,5 @@
 """
-Imaris XTension: Import syGlass Masks and Counting Points into Imaris.
+Imaris XTension: Import syGlass Masks into Imaris.
 
 Runs inside a live Imaris session.  Imaris calls XTImportFromSyGlass(imarisFile)
 where imarisFile is the numeric handle for the ImarisLib COM connection.
@@ -36,15 +36,12 @@ Progress + logs:
   A tkinter window shows the estimated finish time.  A timestamped log is written to a
   'logs' folder inside the script's own directory (…/<script_dir>/logs/import_from_syglass_xt_*.log).
 
-Spots (counting points):
-  Read countingPoints from .sym LevelDB and create ISpots.  EXPERIMENTAL and off by
-  default — the on-disk record layout and the syGlass → Imaris coordinate transform are
-  both unconfirmed, so imported positions should not be trusted.  Enable it from the
-  options menu only to help work the format out.  I have never tested this so it likely
-  will not work at all.
-
 Limitations:
-  Single timepoint. Multichannel is fine. Points/spots likely nonfunctional.
+  Single timepoint. Multichannel is fine.  Counting points are NOT imported: a .sym
+  reader existed (ZIP-wrapped LevelDB, keys 'default::countingPoints::N') but neither
+  its record layout nor the syGlass → Imaris coordinate transform could be confirmed
+  and it never produced usable positions, so it was removed rather than shipped broken
+  — see git history if it is ever picked up again.
 
 Troubleshooting:
     - Ensure that the directory containing this script is in the Imaris Preferences CustomTools → Python path list
@@ -59,14 +56,10 @@ from __future__ import annotations
 
 import datetime
 import os
-import posixpath
-import shutil
 import struct
 import sys
-import tempfile
 import time
 import traceback
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -120,9 +113,6 @@ _PREP_MARGIN_VOXELS = 4
 # be slow and point at the minimum-object-size option.  Log-only: a modal mid-run would
 # stall an unattended import.
 _COMPONENT_WARN_THRESHOLD = 200
-
-# Radius given to imported counting points.
-_SPOT_RADIUS_UM = 0.5
 
 # Open log file handle (set by _setup_logging); every _log() line carries a timestamp
 # so it is clear which step consumes time.  None until setup, in which case _log()
@@ -187,7 +177,7 @@ def _warn(msg: str) -> None:
 #   <CustomTools>
 #       <Menu>
 #           <Item name="Import from syGlass (Development)" icon="Python3"
-#                 tooltip="Import syGlass masks and counting points into the current scene">
+#                 tooltip="Import syGlass masks into the current scene as surfaces">
 #               <Command>Python3XT::XTImportFromSyGlass(%i)</Command>
 #           </Item>
 #       </Menu>
@@ -242,10 +232,6 @@ def _run(imarisFile: int) -> None:
         _log_warning("No .syk file selected — aborting import.")
         return
 
-    # The .sym (counting points / metadata) sits next to the chosen .syk, sharing its stem.
-    syk_dir  = os.path.dirname(syk_path)
-    syk_stem = os.path.splitext(os.path.basename(syk_path))[0]
-    sym_path = os.path.join(syk_dir, syk_stem + ".sym")
     _log(f"using .syk: {syk_path}")
 
     # Fail fast on a locked .syk — before the options dialog, not after minutes of work.
@@ -259,7 +245,7 @@ def _run(imarisFile: int) -> None:
         return
     _log(f"options: smoothing sigma={settings['sigma']}  "
          f"min object size={settings['min_voxels']}  "
-         f"diagnostics={settings['diagnostics']}  spots={settings['spots']}  "
+         f"diagnostics={settings['diagnostics']}  "
          f"block trim={settings['trim']}")
 
     # ----------------------------------------------------------------
@@ -339,13 +325,7 @@ def _run(imarisFile: int) -> None:
         prog.close()
 
     # ----------------------------------------------------------------
-    # 5. Import counting points (spots) from .sym — experimental, opt-in
-    # ----------------------------------------------------------------
-    if settings["spots"] and os.path.exists(sym_path):
-        _import_counting_points(factory, scene, sym_path, geom, ims_stem)
-
-    # ----------------------------------------------------------------
-    # 6. Done — intentionally NO save.
+    # 5. Done — intentionally NO save.
     #    vApp.FileSave("", "") pops Imaris's Save dialog (empty filename) and rewrites the
     #    whole .ims (~3 min on large files).  The surfaces are already in the live Surpass
     #    scene, so we leave saving to the user (Ctrl+S) whenever they choose.
@@ -616,20 +596,6 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
     _log(f"Created {n_labels} surface object(s) in {t_total:.1f}s  "
          f"(prep_wait {sum_prep:.1f}s + upload {sum_upload:.1f}s + detect {sum_detect:.1f}s; "
          f"avg {t_total / max(1, n_labels):.2f}s/label)")
-
-
-def _import_counting_points(factory, scene, sym_path: str, geom: _Geometry,
-                            name_prefix: str) -> None:
-    """Read counting points from the .sym and add them to the scene as ISpots."""
-    spots_xyz = _read_counting_points_from_sym(sym_path, geom)
-    if spots_xyz is None or len(spots_xyz) == 0:
-        return
-    n = len(spots_xyz)
-    vSpots = factory.CreateSpots()
-    vSpots.Set(spots_xyz.tolist(), [0] * n, [_SPOT_RADIUS_UM] * n)
-    vSpots.SetName(name_prefix + " (syGlass counting points — EXPERIMENTAL)")
-    scene.AddChild(vSpots, -1)
-    _log(f"Imported {n} counting points.")
 
 
 # -----------------------------------------------------------------------
@@ -970,75 +936,6 @@ def _log_mask_projections(label_vol):
     _log("mask projection — side (rows=X, cols=Z):")
     for ln in _ascii_projection(side):
         _log("  |" + ln + "|")
-
-
-# -----------------------------------------------------------------------
-# Counting points reader from .sym
-# -----------------------------------------------------------------------
-
-def _read_counting_points_from_sym(sym_path: str, geom: _Geometry) -> np.ndarray | None:
-    """
-    Read syGlass counting points from .sym (ZIP-wrapped LevelDB).  EXPERIMENTAL.
-
-    Counting points are stored under keys 'default::countingPoints::N', each a 20-byte
-    record whose layout is NOT confirmed; this reads the first three float32s as XYZ.
-
-    The syGlass → Imaris coordinate transform is also unconfirmed.  An earlier version of
-    this reader added the .syk header fields at bytes 8–19 to every point as a volume
-    "centre"; those fields are actually the octree BLOCK dimensions (cx, cy, cz) that
-    _read_mask_from_syk uses, so that offset was simply wrong and has been removed.  What
-    remains — scaling raw .syk coordinates by the .ims voxel size — is a plausible guess,
-    not a verified transform.
-
-    TODO: confirm the record layout and the coordinate frame against a file with known
-    point positions, then drop the EXPERIMENTAL gate in the options menu.
-
-    Returns (N, 3) float32 in Imaris physical µm, or None.
-    """
-    try:
-        try:
-            import leveldb  # type: ignore
-        except ImportError:
-            _log("leveldb not available — cannot read .sym counting points.")
-            return None
-
-        _warn("counting-point import is EXPERIMENTAL: the record layout and coordinate "
-              "transform are unconfirmed, so these positions are not trustworthy.")
-
-        tmpdir = tempfile.mkdtemp(prefix="import_from_syglass_xt_")
-        try:
-            with zipfile.ZipFile(sym_path, "r") as zf:
-                for member in zf.namelist():
-                    # Refuse absolute paths and any '..' escape before extracting.
-                    norm = posixpath.normpath(member.replace("\\", "/"))
-                    if norm.startswith(("/", "../")) or norm == ".." or ":" in norm.split("/")[0]:
-                        _warn(f"skipping suspicious .sym entry: {member}")
-                        continue
-                    zf.extract(member, tmpdir)
-
-            db = leveldb.LevelDB(tmpdir)
-            points = []
-
-            prefix = b"default::countingPoints::"
-            for key, val in db.RangeIter():
-                if not key.startswith(prefix):
-                    continue
-                if len(val) >= 12:
-                    x_sg, y_sg, z_sg = struct.unpack_from("<3f", val, 0)
-                    sg_xyz = np.array([x_sg, y_sg, z_sg])
-                    points.append(sg_xyz * geom.voxel_size + geom.ext_min)
-
-            del db
-            if points:
-                return np.array(points, dtype=np.float32)
-            return None
-
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    except Exception as exc:
-        _log(f".sym counting points read failed: {exc}")
-        return None
 
 
 # -----------------------------------------------------------------------
@@ -1470,20 +1367,17 @@ _DEFAULT_MIN_COMPONENT_VOXELS = 0
 def _ask_settings() -> dict | None:
     """
     Show an options menu (tkinter) and return {'sigma': float, 'min_voxels': int,
-    'diagnostics': bool, 'spots': bool, 'trim': (int, int, int)}, or None if the user
-    cancelled.
+    'diagnostics': bool, 'trim': (int, int, int)}, or None if the user cancelled.
 
-    Lets the user pick a surface-smoothing preset or type a custom blur, toggle
-    troubleshooting (block diagnostics + mask preview in the log), and opt in to the
-    experimental counting-point import.  Defaults are FIXED every run rather than
-    remembered: this runs on shared core workstations (same reasoning as _ask_for_syk),
-    where the previous user's choices — especially a hand-edited block trim or the
-    experimental spots toggle — are a trap for the next user.
+    Lets the user pick a surface-smoothing preset or type a custom blur, and toggle
+    troubleshooting (block diagnostics + mask preview in the log).  Defaults are FIXED
+    every run rather than remembered: this runs on shared core workstations (same
+    reasoning as _ask_for_syk), where the previous user's choices — especially a
+    hand-edited block trim — are a trap for the next user.
     """
     defaults = {"sigma": _DEFAULT_SIGMA,
                 "min_voxels": _DEFAULT_MIN_COMPONENT_VOXELS,
                 "diagnostics": False,
-                "spots": False,
                 "trim": _DEFAULT_TRIM}
     try:
         import tkinter as tk
@@ -1545,16 +1439,10 @@ def _ask_settings() -> dict | None:
         minvox_entry.insert(0, str(defaults["min_voxels"]))
         minvox_entry.pack(side="left")
 
-        # ---- Advanced tab: diagnostics, experimental, block geometry -------
+        # ---- Advanced tab: diagnostics, block geometry ---------------------
         diag_var = tk.BooleanVar(value=defaults["diagnostics"])
         tk.Checkbutton(advanced, text="Troubleshooting: log block diagnostics + mask preview",
-                       variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 2))
-
-        spots_var = tk.BooleanVar(value=defaults["spots"])
-        tk.Checkbutton(advanced,
-                       text="Import .sym counting points (EXPERIMENTAL — untested, "
-                            "positions unverified)",
-                       variable=spots_var, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+                       variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 10))
 
         tk.Label(advanced, text="Block trim X,Y,Z", font=("", 10, "bold"),
                  anchor="w").pack(fill="x", padx=14, pady=(6, 0))
@@ -1606,7 +1494,6 @@ def _ask_settings() -> dict | None:
             out["sigma"] = max(0.0, s_val)
             out["min_voxels"] = max(0, mv)
             out["diagnostics"] = bool(diag_var.get())
-            out["spots"] = bool(spots_var.get())
             out["trim"] = tuple(parts)
             root.quit()
 
