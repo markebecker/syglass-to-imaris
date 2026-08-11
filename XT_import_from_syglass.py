@@ -46,7 +46,7 @@ Troubleshooting:
     - Ensure that the directory containing this script is in the Imaris Preferences CustomTools → Python path list
     - Check the log file for errors.
     - Turn on diagnostics in the options menu to see ASCII max-projections of the reconstructed mask (shape sanity check, independent of Imaris).
-    - Check in Task Manager- Python and Imaris should use resources.
+    - If the import appears hung, check Task Manager: both Python and Imaris should show CPU activity while surfaces are built.
 
 Python 3.11 compatibility required (Imaris bundled interpreter).
 """
@@ -416,7 +416,7 @@ def _inventory_labels(label_vol: np.ndarray):
     Returns (label_ids, counts) where counts is indexed by label value.
     """
     counts = np.zeros(2 ** 16, dtype=np.int64)
-    slab = max(1, 64)
+    slab = 64
     for x0 in range(0, label_vol.shape[0], slab):
         block = label_vol[x0:x0 + slab]
         counts += np.bincount(block.ravel(), minlength=2 ** 16)
@@ -505,6 +505,7 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
 
     t_run0 = time.time()
     sum_prep = sum_upload = sum_detect = 0.0
+    n_items = n_objects = 0
 
     # One worker is enough: the loop only submits the next prep after collecting the
     # current one, so at most one prep is ever in flight.
@@ -588,6 +589,8 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             surfaces.SetColorRGBA(_pack_rgba(r, g, b, 255))
             surfaces.SetName(f"{name_prefix} label {label_id}")
             scene.AddChild(surfaces, -1)
+            n_items += 1
+            n_objects += n_comps
 
             sum_prep += t_prep; sum_upload += t_up; sum_detect += t_det
             _log(f"{tag}: prep_wait={t_prep:.2f}s  upload={t_up:.2f}s  "
@@ -595,7 +598,8 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             prog.end_label(t_prep + t_up + t_det)
 
     t_total = time.time() - t_run0
-    _log(f"Created {n_labels} surface object(s) in {t_total:.1f}s  "
+    _log(f"Created {n_items} surface item(s) holding {n_objects} object(s) "
+         f"in {t_total:.1f}s  "
          f"(prep_wait {sum_prep:.1f}s + upload {sum_upload:.1f}s + detect {sum_detect:.1f}s; "
          f"avg {t_total / max(1, n_labels):.2f}s/label)")
 
@@ -610,9 +614,10 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
     Read the syGlass label mask from a .syk file.
 
     Scans all block headers to inventory the octree, reads the root block to
-    estimate the mask bounding box, then composites only the deepest-level
-    blocks that fall within that bbox.  This avoids allocating the full
-    (potentially huge) reconstructed volume.
+    estimate the mask bounding box, then composites every LEAF block (childless,
+    at whatever level it sits — coarse leaves are upsampled) that falls within
+    that bbox.  Reading only the bbox avoids allocating the full (potentially
+    huge) reconstructed volume.
 
     Returns ((NX, NY, NZ) uint16 array, clip_info) where
       clip_info = (vx0, vy0, vz0, full_nx, full_ny, full_nz)
@@ -1393,11 +1398,7 @@ def _ask_settings() -> dict | None:
                             "less voxel detail.",
                  anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
                                                                   pady=(0, 6))
-        preset_vals = [v for _, v in _SMOOTHING_LEVELS]
-        is_preset = defaults["sigma"] in preset_vals
-        # A saved custom sigma leaves every radio unselected (-1 matches no preset) and
-        # prefills the custom box, so the dialog shows what will actually be used.
-        sigma_var = tk.DoubleVar(value=defaults["sigma"] if is_preset else -1.0)
+        sigma_var = tk.DoubleVar(value=defaults["sigma"])
 
         crow = tk.Frame(basic)
         custom = tk.Entry(crow, width=8)
@@ -1416,8 +1417,6 @@ def _ask_settings() -> dict | None:
         crow.pack(fill="x", padx=26, pady=(4, 12))
         tk.Label(crow, text="…or custom blur:").pack(side="left")
         custom.pack(side="left", padx=6)
-        if not is_preset:
-            custom.insert(0, str(defaults["sigma"]))
 
         # Debris is deliberately NOT filtered at import: every disconnected piece becomes
         # its own surface object, so users size-filter interactively in Imaris (Filter
@@ -1512,8 +1511,8 @@ class _Progress:
     Two kinds of update:
       • phase(text) — the fixed one-off stages (reading mask, inventorying labels) that run
         before any per-label work.  No label count needed; the bar sits at its current value.
-      • the per-label cycle: preparing() → [band()×N (upload) → detecting()] per
-        component → end_label().
+      • the per-label cycle: preparing() → begin_label() →
+        [band()×N (upload) → detecting() → meshed()] per component → end_label().
 
     ETA is *live*, and accounts for upload and meshing separately — AddSurface time per
     component is far from proportional to upload bytes, so band ticks alone undershot
@@ -1617,7 +1616,7 @@ class _Progress:
     def _value(self) -> int:
         if not self.n_labels:
             return 0
-        intra = min(self.cur_tick / self.cur_ticks, 1.0) if self.cur_ticks else 1.0
+        intra = min(self.cur_tick / self.cur_ticks, 1.0)
         frac = min(1.0, (self.cur + intra) / self.n_labels)
         return int(frac * self._SCALE)
 
@@ -1677,9 +1676,9 @@ class _Progress:
 
     def detecting(self, comp_idx: int | None = None, n_comps: int | None = None) -> None:
         """
-        Caption only; the bar stays wherever the upload ticks left it.  With one mesh
-        call per component, "label complete" cannot be inferred here, so the tick count
-        is deliberately NOT slammed to the label's maximum the way it once was.
+        Caption only; the bar stays wherever the upload ticks left it.  cur_tick must
+        not be advanced here: more component uploads may follow in this label, and the
+        bar only reads "label complete" at end_label().
         """
         self.mesh_start = time.time()
         if comp_idx is not None and n_comps and n_comps > 1:
