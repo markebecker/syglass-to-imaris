@@ -971,10 +971,10 @@ def _label_components(mask: np.ndarray):
     """
     try:
         from scipy.ndimage import label as nd_label
-        comp, n = nd_label(mask)
-        return comp.astype(np.int32, copy=False), int(n)
-    except Exception:
+    except ImportError:
         return _label_components_numpy(mask)
+    comp, n = nd_label(mask)
+    return comp.astype(np.int32, copy=False), int(n)
 
 
 def _label_components_numpy(mask: np.ndarray):
@@ -1055,9 +1055,10 @@ def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
     if sigma > 0:
         try:
             from scipy.ndimage import gaussian_filter
-            blur = gaussian_filter(sub.astype(np.float32), sigma=sigma)
-        except Exception:
+        except ImportError:
             blur = _smooth_mask_3d(sub, iterations=max(1, int(round(2 * sigma))))
+        else:
+            blur = gaussian_filter(sub.astype(np.float32), sigma=sigma)
         signed = np.clip((blur - 0.5) * 200.0, -120, 120)     # +inside, −outside, 0 at surface
         return signed.astype(np.int8).view(np.uint8)
     return np.where(sub, 100, 200).astype(np.uint8)          # blocky, voxel fidelity
@@ -1485,8 +1486,10 @@ def _ask_settings() -> dict | None:
             return None
 
         return out or defaults
-    except Exception as exc:
-        _log(f"options menu unavailable ({exc}); using defaults {defaults}")
+    except Exception:
+        # Meant for headless setups where tkinter can't open a display — but a bug in the
+        # dialog code lands here too, so log the full traceback to tell the two apart.
+        _log(f"options menu unavailable; using defaults {defaults}\n{traceback.format_exc()}")
         return defaults
 
 
