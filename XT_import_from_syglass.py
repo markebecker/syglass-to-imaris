@@ -36,11 +36,8 @@ Progress + logs:
   'logs' folder inside the script's own directory (…/<script_dir>/logs/import_from_syglass_xt_*.log).
 
 Limitations:
-  Single timepoint. Multichannel is fine.  Counting points are NOT imported: a .sym
-  reader existed (ZIP-wrapped LevelDB, keys 'default::countingPoints::N') but neither
-  its record layout nor the syGlass → Imaris coordinate transform could be confirmed
-  and it never produced usable positions, so it was removed rather than shipped broken
-  — see git history if it is ever picked up again.
+  Single timepoint. Multichannel is fine.  Counting points are not imported — a prior
+  experimental .sym reader is in git history if that is ever picked up again.
 
 Troubleshooting:
     - Ensure that the directory containing this script is in the Imaris Preferences CustomTools → Python path list
@@ -65,9 +62,6 @@ import numpy as np
 
 # ImarisLib — always available in Imaris's Python interpreter
 import ImarisLib  # type: ignore  # noqa: E402
-# NOTE: the syglass/pyglass API path was removed.  pyglass seems to be geared toward .syg-based
-# projects and did not work well with the .syk/.ims pairs used here, so masks come straight
-# from the .syk parser (_read_mask_from_syk).
 
 
 # -----------------------------------------------------------------------
@@ -760,14 +754,11 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
 
-        # There is no seam-filling pass.  An earlier version scanned the whole volume for
-        # 1-voxel gaps and patched them, at a measured cost of ~20 s and tens of GB of
-        # temporaries; with a correct trim the blocks join without gaps, so it was removed
-        # rather than kept as insurance.  If a file does show gaps at block boundaries the
-        # trim is likely wrong for it — adjust it in the options menu, and turn on
-        # troubleshooting for the seam probe below.
-        #
-        # Troubleshooting only: value profile across block boundaries (should read '1111|1111').
+        # Deliberately NO seam-filling pass, and don't re-add one as insurance: patching
+        # 1-voxel gaps costs ~20 s and tens of GB of temporaries, and with a correct trim
+        # the blocks join without gaps.  Gaps at block boundaries mean the trim is wrong
+        # for this file — adjust it in the options menu and verify with the seam probe
+        # below (diagnostics; a clean join reads '1111|1111').
         if diagnostics:
             _probe_seams(vol, ax, ay, az, (bbox_x0, bbox_y0, bbox_z0))
 
