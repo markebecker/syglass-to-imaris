@@ -54,7 +54,6 @@ Python 3.11 compatibility required (Imaris bundled interpreter).
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import posixpath
 import shutil
@@ -115,9 +114,6 @@ _PREP_MARGIN_VOXELS = 4
 
 # Radius given to imported counting points.
 _SPOT_RADIUS_UM = 0.5
-
-# Remembers the options-menu choices between runs.
-_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".import_from_syglass_xt.json")
 
 # Open log file handle (set by _setup_logging); every _log() line carries a timestamp
 # so it is clear which step consumes time.  None until setup, in which case _log()
@@ -1158,22 +1154,6 @@ def _pack_rgba(r: int, g: int, b: int, a: int) -> int:
 # File selection
 # -----------------------------------------------------------------------
 
-def _load_config() -> dict:
-    try:
-        with open(_CONFIG_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_config(cfg: dict) -> None:
-    try:
-        with open(_CONFIG_PATH, "w") as f:
-            json.dump(cfg, f)
-    except Exception:
-        pass
-
-
 def _resolve_syk_path(ims_dir: str, ims_stem: str) -> str | None:
     """
     Find the .syk for the open .ims.
@@ -1278,10 +1258,14 @@ def _ask_for_syk(initialdir: str) -> str | None:
 # Surface-smoothing presets: label → Gaussian blur sigma (voxels).  0 = raw voxel fidelity.
 _SMOOTHING_LEVELS = [
     ("None — voxel fidelity (blocky)", 0.0),
-    ("Light", 0.8),
+    ("Light", 1.0),
     ("Medium", 1.5),
     ("Strong", 2.5),
 ]
+
+# The preset selected each time the dialog opens.  Must be one of the _SMOOTHING_LEVELS
+# values or the radio buttons won't pre-select it.
+_DEFAULT_SIGMA = 1.0
 
 
 def _ask_settings() -> dict | None:
@@ -1291,14 +1275,15 @@ def _ask_settings() -> dict | None:
 
     Lets the user pick a surface-smoothing preset or type a custom blur, toggle
     troubleshooting (block diagnostics + mask preview in the log), and opt in to the
-    experimental counting-point import.  Choices persist in the config so they default to
-    last time.  Falls back to the saved defaults if no GUI is available.
+    experimental counting-point import.  Defaults are FIXED every run rather than
+    remembered: this runs on shared core workstations (same reasoning as _ask_for_syk),
+    where the previous user's choices — especially a hand-edited block trim or the
+    experimental spots toggle — are a trap for the next user.
     """
-    cfg = _load_config()
-    defaults = {"sigma": float(cfg.get("smoothing_sigma", 0.0)),
-                "diagnostics": bool(cfg.get("diagnostics", False)),
-                "spots": bool(cfg.get("spots", False)),
-                "trim": tuple(cfg.get("trim", _DEFAULT_TRIM))}
+    defaults = {"sigma": _DEFAULT_SIGMA,
+                "diagnostics": False,
+                "spots": False,
+                "trim": _DEFAULT_TRIM}
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -1407,15 +1392,9 @@ def _ask_settings() -> dict | None:
         if state["cancelled"]:
             return None
 
-        result = out or defaults
-        cfg["smoothing_sigma"] = result["sigma"]
-        cfg["diagnostics"] = result["diagnostics"]
-        cfg["spots"] = result["spots"]
-        cfg["trim"] = list(result["trim"])
-        _save_config(cfg)
-        return result
+        return out or defaults
     except Exception as exc:
-        _log(f"options menu unavailable ({exc}); using saved defaults {defaults}")
+        _log(f"options menu unavailable ({exc}); using defaults {defaults}")
         return defaults
 
 
