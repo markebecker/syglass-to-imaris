@@ -121,6 +121,13 @@ class _SykLockedError(RuntimeError):
     """The .syk is held open by syGlass (Windows sharing violation → PermissionError)."""
 
 
+# How to release a locked .syk — shared by the retry dialog and the give-up warning.
+# Two steps because syGlass has been seen keeping the file handle open even after the
+# project itself is closed.
+_LOCKED_SYK_HINT = ("Close the project in syGlass. If the file is still locked after "
+                    "that, exit syGlass entirely.")
+
+
 # -----------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------
@@ -276,8 +283,8 @@ def _run(imarisFile: int) -> None:
         except _SykLockedError:
             if not _ensure_syk_readable(syk_path):
                 prog.close()
-                _warn_dialog("The .syk is locked by syGlass — close the project "
-                             "(or exit syGlass entirely) and re-run the import.")
+                _warn_dialog(f"The .syk is locked by syGlass. {_LOCKED_SYK_HINT} "
+                             f"Then re-run the import.")
                 return
 
     if label_vol is None or not np.any(label_vol):
@@ -571,7 +578,7 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                 dt_mesh = time.time() - t0
                 t_det += dt_mesh
                 prog.meshed(dt_mesh)
-            del comps, field, prep   # free this label's fields before the next is awaited
+            del comps, prep   # free this label's fields before the next prep is awaited
 
             try:
                 n_surf = surfaces.GetNumberOfSurfaces()
@@ -1285,9 +1292,7 @@ def _ensure_syk_readable(path: str) -> bool:
     project itself is closed, in which case only exiting syGlass releases it.
     """
     msg = (f"The .syk file is locked by syGlass:\n\n{path}\n\n"
-           "Close the project in syGlass, then press Retry.\n"
-           "If it still fails after closing the project, exit syGlass entirely "
-           "and press Retry.")
+           f"{_LOCKED_SYK_HINT}\n\nThen press Retry.")
     while _syk_is_locked(path):
         _warn(f".syk locked by syGlass: {path}")
         try:
@@ -1484,7 +1489,8 @@ def _ask_settings() -> dict | None:
         if state["cancelled"]:
             return None
 
-        return out or defaults
+        # mainloop only exits via _ok or _cancel, so out is fully populated here.
+        return out
     except Exception:
         # Meant for headless setups where tkinter can't open a display — but a bug in the
         # dialog code lands here too, so log the full traceback to tell the two apart.
