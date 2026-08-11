@@ -37,7 +37,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inspect_syk import (HEADER_BYTES, BLOCK_HEADER_BYTES, FVGU,
-                         read_u16, block_level, block_position)
+                         read_u16, block_level)
 
 
 def line(payload, cx, cy, cz, axis, a, b):

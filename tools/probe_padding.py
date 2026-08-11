@@ -33,7 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from inspect_syk import (HEADER_BYTES, BLOCK_HEADER_BYTES, FVGU,
-                         read_u16, block_level, block_position, take_slice)
+                         read_u16, block_level, take_slice)
 
 
 def agree(sa, sb):
