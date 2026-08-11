@@ -1399,8 +1399,11 @@ def _ask_settings() -> dict | None:
             """A preset click wins over a stale custom value (see _ok)."""
             custom.delete(0, "end")
 
+        # Presets show their blur value, so a user who wants something in between can
+        # just type it in the custom box.
         for name, val in _SMOOTHING_LEVELS:
-            tk.Radiobutton(basic, text=name, variable=sigma_var, value=val, anchor="w",
+            text = name if val <= 0 else f"{name} (blur {val:g})"
+            tk.Radiobutton(basic, text=text, variable=sigma_var, value=val, anchor="w",
                            command=_clear_custom).pack(fill="x", padx=26)
 
         crow.pack(fill="x", padx=26, pady=(4, 12))
