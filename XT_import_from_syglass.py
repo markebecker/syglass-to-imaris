@@ -20,13 +20,17 @@ Masks:
      — those with no stored children, which may sit above the deepest level — are then
      read and composited.  Blocks are stored (CZ, CY, CX) and overlap their neighbours;
      see _DEFAULT_TRIM for the per-axis overlap.
-  2. For each label, build a signed uint8 field cropped to that label's bounding box
-     (sigma <= 0: binary 100=inside / 200=outside; sigma > 0: a clipped Gaussian
-     gradient), and upload it in bands via SetDataSubVolumeAs1DArrayBytes, each call
-     kept under the Ice message limit.
-  3. Then call ISurfaces.AddSurface once — Imaris meshes the zero crossing for all of
-     that label's blobs.  Prep for the next label runs on a worker thread while the
-     current one uploads.
+  2. Split each label into its disconnected components, and build a signed uint8 field
+     per component, cropped to the component's bounding box (sigma <= 0: binary
+     100=inside / 200=outside; sigma > 0: a clipped Gaussian gradient).  Each field is
+     uploaded in bands via SetDataSubVolumeAs1DArrayBytes, each call kept under the Ice
+     message limit.
+  3. Call ISurfaces.AddSurface once per component, all into ONE ISurfaces item per
+     label: the scene tree shows one entry per label, but inside it every component is
+     its own surface object, so debris is selectable and size-filterable in Imaris
+     (Filter tab, e.g. "Number of Voxels").  An optional minimum object size drops
+     debris before upload instead.  Prep for the next label runs on a worker thread
+     while the current one uploads.
 
 Progress + logs:
   A tkinter window shows the estimated finish time.  A timestamped log is written to a
@@ -111,6 +115,11 @@ _ROOT_BBOX_MARGIN_BLOCKS = 2
 # Minimum crop padding (voxels) around a label's bounding box, so a blurred field has
 # room to fall back to "outside" without touching the crop wall.
 _PREP_MARGIN_VOXELS = 4
+
+# Above this many components in one label, warn that per-component AddSurface calls will
+# be slow and point at the minimum-object-size option.  Log-only: a modal mid-run would
+# stall an unattended import.
+_COMPONENT_WARN_THRESHOLD = 200
 
 # Radius given to imported counting points.
 _SPOT_RADIUS_UM = 0.5
@@ -249,6 +258,7 @@ def _run(imarisFile: int) -> None:
         _log("options menu cancelled — nothing imported.")
         return
     _log(f"options: smoothing sigma={settings['sigma']}  "
+         f"min object size={settings['min_voxels']}  "
          f"diagnostics={settings['diagnostics']}  spots={settings['spots']}  "
          f"block trim={settings['trim']}")
 
@@ -324,7 +334,7 @@ def _run(imarisFile: int) -> None:
     scene   = vApp.GetSurpassScene()
     try:
         _build_surfaces(factory, scene, label_vol, label_ids, geom, clip_info,
-                        settings["sigma"], prog, ims_stem)
+                        settings["sigma"], settings["min_voxels"], prog, ims_stem)
     finally:
         prog.close()
 
@@ -464,19 +474,27 @@ def _resolve_uint8_type():
 
 
 def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_info,
-                    sigma: float, prog, name_prefix: str) -> None:
+                    sigma: float, min_voxels: int, prog, name_prefix: str) -> None:
     """
-    Create one ISurfaces object per label and add it to the Surpass scene.
+    Create one ISurfaces item per label — holding one surface OBJECT per disconnected
+    component — and add it to the Surpass scene.
 
     AddSurface interprets the dataset as a signed field and finds the surface at the zero
-    crossing.  uint8 is treated as signed int8: 100 → +100 (inside), 200 → −56 (outside).
-    Each label's IDataSet is sized to that label's OWN bounding box (not the full
-    reconstruction — which may be billions of mostly-empty voxels), with physical extents
-    for just that sub-region.  Data is uploaded in chunks kept under the Ice message limit.
+    crossing (uint8 treated as signed int8: 100 → +100 inside, 200 → −56 outside), and
+    each call yields exactly one surface object however many blobs the field contains.
+    So every component gets its own IDataSet, sized to the component's OWN bounding box
+    (not the full reconstruction — which may be billions of mostly-empty voxels), and its
+    own AddSurface call; that is what makes debris individually selectable and
+    size-filterable in Imaris.  Data is uploaded in chunks kept under the Ice limit.
 
-    Prefetch depth 1: prep for the NEXT label (crop + smooth + signed-field build) runs on a
-    background thread while the main thread uploads the CURRENT one, so the pure-NumPy prep
-    overlaps the serial COM I/O.
+    If per-component AddSurface round-trips ever prove too slow on debris-heavy labels,
+    the alternative is to relabel components as distinct values and make ONE
+    IImageProcessing.DetectSurfacesFromLabelImage call — but that bypasses the signed
+    field, so the surfaces come out blocky; not worth it until timing says otherwise.
+
+    Prefetch depth 1: prep for the NEXT label (crop + split + smooth + field build) runs
+    on a background thread while the main thread uploads the CURRENT one, so the
+    pure-NumPy prep overlaps the serial COM I/O.
     """
     eTypeUInt8 = _resolve_uint8_type()
     vol_shape = np.array(label_vol.shape)
@@ -509,7 +527,7 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
     # One worker is enough: the loop only submits the next prep after collecting the
     # current one, so at most one prep is ever in flight.
     with ThreadPoolExecutor(max_workers=1) as pool:
-        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma)
+        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma, min_voxels)
         for label_idx, label_id in enumerate(label_ids):
             tag = f"L{label_idx + 1}/{n_labels} (id {label_id})"
 
@@ -519,43 +537,66 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             t_prep = time.time() - t0
             # Kick off prep for the next label so it overlaps this label's upload.
             if label_idx + 1 < n_labels:
-                next_future = pool.submit(_prep_label, label_vol, label_ids[label_idx + 1], sigma)
+                next_future = pool.submit(_prep_label, label_vol, label_ids[label_idx + 1],
+                                          sigma, min_voxels)
 
-            if prep is None:
-                _log(f"{tag}: empty — skipped")
+            if prep is None or not prep["components"]:
+                if prep is None:
+                    _log(f"{tag}: empty — skipped")
+                else:
+                    _log(f"{tag}: none of the {prep['n_components']} component(s) "
+                         f"survived the size filter ({min_voxels} voxels) and blur — "
+                         f"skipped")
                 prog.begin_label(label_idx, 1)
                 prog.end_label(0.0)
                 continue
 
-            field, offset, n_painted, n_kept = prep
-            crop = np.array(field.shape)
-            prog.begin_label(label_idx, _upload_ticks(*crop))
+            comps = prep["components"]
+            n_comps = len(comps)
+            _log(f"{tag}: {n_comps}/{prep['n_components']} component(s); "
+                 f"painted={prep['n_painted']}"
+                 + (f"; dropped {prep['n_dropped']} under {min_voxels} voxels "
+                    f"({prep['dropped_voxels']} vox)" if prep["n_dropped"] else ""))
+            if prep["n_vanished"]:
+                _log(f"{tag}: {prep['n_vanished']} component(s) vanished under the blur "
+                     f"({prep['vanished_voxels']} vox) — too small for sigma={sigma}; "
+                     f"lower the smoothing to keep them")
+            if n_comps > _COMPONENT_WARN_THRESHOLD:
+                _warn(f"{tag}: {n_comps} disconnected components — one AddSurface call "
+                      f"each will be slow; consider raising the minimum object size in "
+                      f"the options menu")
 
-            # Physical extents of this label's crop (sub-region of the clip volume).
-            lo, hi = _field_extents(ds_lo, per_voxel, offset, crop)
-            _log(f"{tag}: crop {crop[0]}x{crop[1]}x{crop[2]} "
-                 f"({crop.prod() / 1e6:.1f} MB) at voxel "
-                 f"({offset[0]},{offset[1]},{offset[2]}); painted={n_painted} kept={n_kept}; "
-                 f"bbox um X=[{lo[0]:.0f},{hi[0]:.0f}] Y=[{lo[1]:.0f},{hi[1]:.0f}] "
-                 f"Z=[{lo[2]:.0f},{hi[2]:.0f}]")
-
-            sdf_ds = factory.CreateDataSet()
-            sdf_ds.Create(eTypeUInt8, int(crop[0]), int(crop[1]), int(crop[2]), 1, 1)
-            sdf_ds.SetExtendMinX(lo[0]); sdf_ds.SetExtendMinY(lo[1]); sdf_ds.SetExtendMinZ(lo[2])
-            sdf_ds.SetExtendMaxX(hi[0]); sdf_ds.SetExtendMaxY(hi[1]); sdf_ds.SetExtendMaxZ(hi[2])
-
-            t0 = time.time()
-            _upload_field(sdf_ds, field, prog)
-            t_up = time.time() - t0
-            del field, prep   # free this label's prep before the next is awaited
-
-            # ONE AddSurface on the whole cropped field — meshes all of the label's blobs
-            # at once.
+            prog.begin_label(label_idx,
+                             sum(_upload_ticks(*f.shape) for f, _o, _v, _k in comps))
             surfaces = factory.CreateSurfaces()
-            prog.detecting()
-            t0 = time.time()
-            surfaces.AddSurface(sdf_ds, 0)
-            t_det = time.time() - t0
+
+            t_up = t_det = 0.0
+            for ci, (field, offset, comp_voxels, n_kept) in enumerate(comps):
+                crop = np.array(field.shape)
+                # Physical extents of this component's crop (sub-region of the clip volume).
+                lo, hi = _field_extents(ds_lo, per_voxel, offset, crop)
+                _log(f"{tag} c{ci + 1}/{n_comps}: crop {crop[0]}x{crop[1]}x{crop[2]} "
+                     f"({crop.prod() / 1e6:.1f} MB) at voxel "
+                     f"({offset[0]},{offset[1]},{offset[2]}); voxels={comp_voxels} "
+                     f"kept={n_kept}; bbox um X=[{lo[0]:.0f},{hi[0]:.0f}] "
+                     f"Y=[{lo[1]:.0f},{hi[1]:.0f}] Z=[{lo[2]:.0f},{hi[2]:.0f}]")
+
+                sdf_ds = factory.CreateDataSet()
+                sdf_ds.Create(eTypeUInt8, int(crop[0]), int(crop[1]), int(crop[2]), 1, 1)
+                sdf_ds.SetExtendMinX(lo[0]); sdf_ds.SetExtendMinY(lo[1]); sdf_ds.SetExtendMinZ(lo[2])
+                sdf_ds.SetExtendMaxX(hi[0]); sdf_ds.SetExtendMaxY(hi[1]); sdf_ds.SetExtendMaxZ(hi[2])
+
+                t0 = time.time()
+                _upload_field(sdf_ds, field, prog)
+                t_up += time.time() - t0
+
+                # One AddSurface per component = one surface object per component.
+                prog.detecting(ci, n_comps)
+                t0 = time.time()
+                surfaces.AddSurface(sdf_ds, 0)
+                t_det += time.time() - t0
+            del comps, field, prep   # free this label's fields before the next is awaited
+
             try:
                 n_surf = surfaces.GetNumberOfSurfaces()
             except Exception as exc:
@@ -1004,41 +1045,118 @@ def _read_counting_points_from_sym(sym_path: str, geom: _Geometry) -> np.ndarray
 # Per-label field construction
 # -----------------------------------------------------------------------
 
-def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
+def _mask_bbox(mask: np.ndarray, margin: int):
     """
-    Build the signed uint8 field AddSurface meshes for ONE label, CROPPED to its bounding box
-    (CPU-only, thread-safe — no COM/Ice access).
-
-    Returns (field, (ox,oy,oz), n_painted, n_kept) or None if the label is empty.  Imaris reads
-    the uint8 as signed int8 and meshes the zero crossing:
-      sigma <= 0 : binary 100 (inside) / 200 (outside) — voxel fidelity (blocky surface,
-                   nothing eroded).
-      sigma  > 0 : a Gaussian-blurred gradient (+inside … −outside, 0 at the boundary), so
-                   Imaris' marching cubes interpolates a smooth triangulated surface; larger
-                   sigma = smoother (and rounds off / drops fine detail).
-    `margin` grows with sigma so the blur has room to fall back to "outside" inside the crop.
+    Bounding box of the True voxels, padded by `margin` and clamped to the array.
+    Returns ((ox, oy, oz), (x1, y1, z1)) with exclusive upper bounds, or None if empty.
     """
-    mask = label_vol == label_id
     xs = np.any(mask, axis=(1, 2))
     if not xs.any():
         return None
     ys = np.any(mask, axis=(0, 2))
     zs = np.any(mask, axis=(0, 1))
 
-    m = max(margin, int(np.ceil(3 * sigma)) + 1)   # room for the Gaussian tail
-
     def _span(flags, n):
         idx = np.nonzero(flags)[0]
-        return max(0, int(idx[0]) - m), min(n, int(idx[-1]) + 1 + m)
+        return max(0, int(idx[0]) - margin), min(n, int(idx[-1]) + 1 + margin)
 
     ox, x1 = _span(xs, mask.shape[0])
     oy, y1 = _span(ys, mask.shape[1])
     oz, z1 = _span(zs, mask.shape[2])
+    return (ox, oy, oz), (x1, y1, z1)
 
-    sub = mask[ox:x1, oy:y1, oz:z1].copy()   # small crop; copy so the big bool can free
-    del mask
-    n_painted = int(sub.sum())
 
+def _label_components(mask: np.ndarray):
+    """
+    6-connected component labeling of a boolean volume.
+
+    Returns (comp, n): comp is int32 with 0 = background and 1..n numbering the
+    components.  Uses scipy.ndimage.label when available; otherwise the pure-NumPy
+    fallback below (same contract, so the two are interchangeable).
+    """
+    try:
+        from scipy.ndimage import label as nd_label
+        comp, n = nd_label(mask)
+        return comp.astype(np.int32, copy=False), int(n)
+    except Exception:
+        return _label_components_numpy(mask)
+
+
+def _label_components_numpy(mask: np.ndarray):
+    """
+    scipy-free 6-connected component labeling: union-find over z-runs.
+
+    Runs along Z (the contiguous axis) are the unit of work instead of voxels — neuron
+    components are elongated, so run counts stay far below voxel counts and a
+    frontier-BFS's repeated full-volume dilations are avoided.  Runs in z-adjacent
+    overlap within a row are the same run by construction; runs in Y- and X-neighbour
+    rows are unioned when their z-intervals overlap.
+    """
+    m = np.ascontiguousarray(mask, dtype=bool)
+    nx, ny, nz = m.shape
+    n_rows = nx * ny
+    pad = np.zeros((n_rows, nz + 2), dtype=np.int8)
+    pad[:, 1:-1] = m.reshape(n_rows, nz)
+    d = np.diff(pad, axis=1)
+    run_row, run_z0 = np.nonzero(d == 1)     # row-major order: sorted by row, then z
+    _, run_z1 = np.nonzero(d == -1)          # same rows in the same order, exclusive end
+    n_runs = len(run_row)
+    if n_runs == 0:
+        return np.zeros(m.shape, np.int32), 0
+
+    # runs of row r are indices row_start[r] .. row_start[r+1]
+    row_start = np.searchsorted(run_row, np.arange(n_rows + 1))
+    parent = np.arange(n_runs, dtype=np.int64)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]    # path halving
+            i = parent[i]
+        return i
+
+    def merge_rows(r, q):
+        """Union runs of rows r and q whose z-intervals overlap (two-pointer walk)."""
+        i, i_end = row_start[r], row_start[r + 1]
+        j, j_end = row_start[q], row_start[q + 1]
+        while i < i_end and j < j_end:
+            if run_z1[i] <= run_z0[j]:
+                i += 1
+            elif run_z1[j] <= run_z0[i]:
+                j += 1
+            else:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+                if run_z1[i] <= run_z1[j]:   # advance whichever interval ends first
+                    i += 1
+                else:
+                    j += 1
+
+    occupied = np.nonzero(row_start[1:] > row_start[:-1])[0]
+    for r in occupied:
+        if r % ny > 0 and row_start[r - 1] < row_start[r]:        # Y neighbour (x, y-1)
+            merge_rows(r, r - 1)
+        if r >= ny and row_start[r - ny] < row_start[r - ny + 1]:  # X neighbour (x-1, y)
+            merge_rows(r, r - ny)
+
+    roots = np.fromiter((find(i) for i in range(n_runs)), np.int64, n_runs)
+    uniq, comp_of_run = np.unique(roots, return_inverse=True)
+    out = np.zeros((n_rows, nz), np.int32)
+    for i in range(n_runs):
+        out[run_row[i], run_z0[i]:run_z1[i]] = comp_of_run[i] + 1
+    return out.reshape(nx, ny, nz), len(uniq)
+
+
+def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Signed uint8 field for AddSurface from a boolean mask.  Imaris reads the uint8 as
+    signed int8 and meshes the zero crossing:
+      sigma <= 0 : binary 100 (inside) / 200 (outside) — voxel fidelity (blocky surface,
+                   nothing eroded).
+      sigma  > 0 : a Gaussian-blurred gradient (+inside … −outside, 0 at the boundary), so
+                   Imaris' marching cubes interpolates a smooth triangulated surface; larger
+                   sigma = smoother (and rounds off / drops fine detail).
+    """
     if sigma > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -1046,12 +1164,70 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
         except Exception:
             blur = _smooth_mask_3d(sub, iterations=max(1, int(round(2 * sigma))))
         signed = np.clip((blur - 0.5) * 200.0, -120, 120)     # +inside, −outside, 0 at surface
-        field = signed.astype(np.int8).view(np.uint8)
-    else:
-        field = np.where(sub, 100, 200).astype(np.uint8)      # blocky, voxel fidelity
+        return signed.astype(np.int8).view(np.uint8)
+    return np.where(sub, 100, 200).astype(np.uint8)          # blocky, voxel fidelity
 
-    n_kept = int((field.view(np.int8) > 0).sum())
-    return field, (ox, oy, oz), n_painted, n_kept
+
+def _prep_label(label_vol, label_id, sigma=0.0, min_voxels=0, margin=_PREP_MARGIN_VOXELS):
+    """
+    Build the signed uint8 fields AddSurface meshes for ONE label — one field per
+    disconnected component, each cropped to its own bounding box (CPU-only, thread-safe —
+    no COM/Ice access).
+
+    Components are separated so every AddSurface call makes its own surface object in
+    Imaris; that is what lets debris be selected and size-filtered there.  Each component
+    is smoothed in ISOLATION: blurring the whole label at once would leak a nearby
+    component's Gaussian tail into this component's crop and mesh phantom shells there.
+    Components under `min_voxels` voxels are dropped outright.
+
+    Returns None if the label is absent, else a dict:
+      components:     [(field, (ox,oy,oz) offset in label_vol, comp_voxels, n_kept), …]
+                      ordered largest component first
+      n_components:   component count before the size filter
+      n_dropped / dropped_voxels: what the size filter removed
+      n_vanished / vanished_voxels: components the blur erased entirely (no voxel stayed
+                      above 0.5, so there is no zero crossing to mesh) — skipped rather
+                      than sent through a pointless AddSurface call
+      n_painted:      voxels of this label in label_vol
+    `margin` grows with sigma so the blur has room to fall back to "outside" in-crop.
+    """
+    mask = label_vol == label_id
+    m = max(margin, int(np.ceil(3 * sigma)) + 1)   # room for the Gaussian tail
+    bbox = _mask_bbox(mask, m)
+    if bbox is None:
+        return None
+    (lx, ly, lz), (x1, y1, z1) = bbox
+
+    sub = mask[lx:x1, ly:y1, lz:z1].copy()   # small crop; copy so the big bool can free
+    del mask
+    n_painted = int(sub.sum())
+
+    comps, n_comps = _label_components(sub)
+    del sub
+    sizes = np.bincount(comps.ravel())       # sizes[0] = background, ignored
+    floor = max(1, int(min_voxels))
+    keep = sorted((cid for cid in range(1, n_comps + 1) if sizes[cid] >= floor),
+                  key=lambda cid: -sizes[cid])
+    dropped_voxels = int(sum(sizes[cid] for cid in range(1, n_comps + 1)
+                             if sizes[cid] < floor))
+
+    components = []
+    n_vanished = vanished_voxels = 0
+    for cid in keep:
+        cmask = comps == cid                 # isolation: neighbours excluded before blur
+        (ox, oy, oz), (cx1, cy1, cz1) = _mask_bbox(cmask, m)
+        field = _signed_field(cmask[ox:cx1, oy:cy1, oz:cz1], sigma)
+        n_kept = int((field.view(np.int8) > 0).sum())
+        if n_kept == 0:                      # blur erased it: nothing crosses zero
+            n_vanished += 1
+            vanished_voxels += int(sizes[cid])
+            continue
+        components.append((field, (lx + ox, ly + oy, lz + oz), int(sizes[cid]), n_kept))
+
+    return {"components": components, "n_components": n_comps,
+            "n_dropped": n_comps - len(keep), "dropped_voxels": dropped_voxels,
+            "n_vanished": n_vanished, "vanished_voxels": vanished_voxels,
+            "n_painted": n_painted}
 
 
 def _smooth_mask_3d(mask, iterations=3):
@@ -1286,11 +1462,16 @@ _SMOOTHING_LEVELS = [
 # values or the radio buttons won't pre-select it.
 _DEFAULT_SIGMA = 1.0
 
+# Default minimum component size (voxels).  0 keeps everything: debris can always be
+# size-filtered in Imaris afterwards, so nothing is silently dropped by default.
+_DEFAULT_MIN_COMPONENT_VOXELS = 0
+
 
 def _ask_settings() -> dict | None:
     """
-    Show an options menu (tkinter) and return {'sigma': float, 'diagnostics': bool,
-    'spots': bool}, or None if the user cancelled.
+    Show an options menu (tkinter) and return {'sigma': float, 'min_voxels': int,
+    'diagnostics': bool, 'spots': bool, 'trim': (int, int, int)}, or None if the user
+    cancelled.
 
     Lets the user pick a surface-smoothing preset or type a custom blur, toggle
     troubleshooting (block diagnostics + mask preview in the log), and opt in to the
@@ -1300,6 +1481,7 @@ def _ask_settings() -> dict | None:
     experimental spots toggle — are a trap for the next user.
     """
     defaults = {"sigma": _DEFAULT_SIGMA,
+                "min_voxels": _DEFAULT_MIN_COMPONENT_VOXELS,
                 "diagnostics": False,
                 "spots": False,
                 "trim": _DEFAULT_TRIM}
@@ -1350,6 +1532,19 @@ def _ask_settings() -> dict | None:
         if not is_preset:
             custom.insert(0, str(defaults["sigma"]))
 
+        tk.Label(basic, text="Minimum object size (voxels)", font=("", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(6, 0))
+        tk.Label(basic, text="Disconnected pieces smaller than this are skipped at "
+                            "import. 0 = keep everything (each piece is still its own "
+                            "object in Imaris, so it can be size-filtered there); try 50 "
+                            "if the mask has debris speckles.",
+                 anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
+                                                                  pady=(0, 6))
+        mrow = tk.Frame(basic); mrow.pack(fill="x", padx=26, pady=(0, 12))
+        minvox_entry = tk.Entry(mrow, width=8)
+        minvox_entry.insert(0, str(defaults["min_voxels"]))
+        minvox_entry.pack(side="left")
+
         # ---- Advanced tab: diagnostics, experimental, block geometry -------
         diag_var = tk.BooleanVar(value=defaults["diagnostics"])
         tk.Checkbutton(advanced, text="Troubleshooting: log block diagnostics + mask preview",
@@ -1388,6 +1583,10 @@ def _ask_settings() -> dict | None:
                 except ValueError:
                     pass
             out["sigma"] = max(0.0, s_val)
+            try:
+                out["min_voxels"] = max(0, int(minvox_entry.get().strip() or 0))
+            except ValueError:
+                out["min_voxels"] = defaults["min_voxels"]
             out["diagnostics"] = bool(diag_var.get())
             out["spots"] = bool(spots_var.get())
             try:
@@ -1429,7 +1628,8 @@ class _Progress:
     Two kinds of update:
       • phase(text) — the fixed one-off stages (reading mask, inventorying labels) that run
         before any per-label work.  No label count needed; the bar sits at its current value.
-      • the per-label cycle: preparing() → band()×N (upload) → detecting() → end_label().
+      • the per-label cycle: preparing() → [band()×N (upload) → detecting()] per
+        component → end_label().
 
     ETA is *live*: during a label's upload the current label's duration is projected from how
     far its band ticks have progressed (elapsed / fraction_done), so even a single-label run
@@ -1549,10 +1749,17 @@ class _Progress:
         if self.cur_tick % self.every == 0 or self.cur_tick >= self.cur_ticks:
             self._label_caption("uploading")
 
-    def detecting(self) -> None:
-        """Caption only; leave the determinate bar in place (see class note)."""
-        self.cur_tick = self.cur_ticks
-        self._label_caption("meshing surface (Imaris working)…")
+    def detecting(self, comp_idx: int | None = None, n_comps: int | None = None) -> None:
+        """
+        Caption only; the bar stays wherever the upload ticks left it.  With one mesh
+        call per component, "label complete" cannot be inferred here, so the tick count
+        is deliberately NOT slammed to the label's maximum the way it once was.
+        """
+        if comp_idx is not None and n_comps and n_comps > 1:
+            self._label_caption(f"meshing surface {comp_idx + 1}/{n_comps} "
+                                f"(Imaris working)…")
+        else:
+            self._label_caption("meshing surface (Imaris working)…")
 
     def end_label(self, duration: float) -> None:
         self.times.append(duration)

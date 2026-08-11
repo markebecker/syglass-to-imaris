@@ -177,29 +177,133 @@ def test_octree_maths(chk) -> None:
         XT._pack_rgba(255, 0, 0, 255) == int(np.uint32(0xFF0000FF).astype(np.int32)))
 
 
+def test_components(chk) -> None:
+    """
+    6-connected component labeling: the scipy path and the NumPy run-length union-find
+    fallback must be interchangeable, so both are pinned to the same answers.
+    """
+    def parts(comp, n):
+        """Partition as a set of coordinate frozensets — label numbering is arbitrary."""
+        return {frozenset(zip(*np.nonzero(comp == cid))) for cid in range(1, n + 1)}
+
+    two = np.zeros((10, 10, 10), bool)
+    two[1:3, 1:3, 1:3] = True
+    two[6:9, 6:9, 6:9] = True
+
+    diag = np.zeros((4, 4, 4), bool)     # touching only diagonally = NOT connected
+    diag[1, 1, 1] = True
+    diag[2, 2, 1] = True
+
+    # U-shape: two arms whose runs meet only at the far row — the classic case where two
+    # provisional labels must be merged late by the union-find.
+    u = np.zeros((5, 1, 4), bool)
+    u[:, 0, 0] = True
+    u[:, 0, 3] = True
+    u[4, 0, :] = True
+
+    single = np.zeros((3, 3, 3), bool)
+    single[1, 1, 1] = True
+
+    empty = np.zeros((3, 3, 3), bool)
+
+    for name, vol, want in [("two blobs", two, 2), ("diagonal pair", diag, 2),
+                            ("U-shape", u, 1), ("single voxel", single, 1),
+                            ("empty", empty, 0)]:
+        cf, nf = XT._label_components_numpy(vol)
+        cd, nd = XT._label_components(vol)
+        chk(f"components fallback: {name} -> {want}", nf == want, f"(got {nf})")
+        chk(f"components dispatch: {name} matches fallback",
+            nd == nf and parts(cd, nd) == parts(cf, nf))
+        chk(f"components {name}: labels cover exactly the mask",
+            np.array_equal(cf > 0, vol))
+
+    try:
+        from scipy.ndimage import label as nd_label
+    except Exception:
+        nd_label = None
+    if nd_label is not None:
+        blobby = rng.random((24, 24, 24)) > 0.75     # many speckle components
+        cs, ns = nd_label(blobby)
+        cf, nf = XT._label_components_numpy(blobby)
+        chk("components fallback matches scipy on speckle",
+            ns == nf and parts(cs, ns) == parts(cf, nf), f"(scipy {ns}, numpy {nf})")
+    else:
+        print("skip  components scipy parity (scipy not installed)")
+
+
 def test_prep_label(chk) -> None:
     """
-    The signed field Imaris meshes: uint8 read as int8, so 100 is inside (+100) and 200 is
-    outside (-56).  Anything non-positive would produce no zero crossing and no surface.
+    The signed fields Imaris meshes, one per disconnected component: uint8 read as int8,
+    so 100 is inside (+100) and 200 is outside (-56).  Anything non-positive would
+    produce no zero crossing and no surface.
     """
-    vol = np.zeros((40, 40, 40), np.uint16)
-    vol[10:20, 12:22, 14:24] = 3
-    vol[30, 30, 30] = 5
+    vol = np.zeros((60, 40, 40), np.uint16)
+    vol[10:20, 12:22, 14:24] = 3     # 1000 voxels
+    vol[30:35, 5:10, 5:10] = 3       # 125 voxels
+    vol[50, 30, 30] = 3              # 1-voxel speck
+    vol[2, 2, 2] = 5                 # another label, must not leak in
 
-    field, off, n_painted, _n_kept = XT._prep_label(vol, 3, sigma=0.0)
-    chk("prep crops to one label only", n_painted == 1000, f"(painted {n_painted})")
+    prep = XT._prep_label(vol, 3, sigma=0.0)
+    comps = prep["components"]
+    chk("prep finds every disconnected component",
+        prep["n_components"] == 3 and len(comps) == 3)
+    chk("prep orders components largest first",
+        [c[2] for c in comps] == [1000, 125, 1])
+    chk("prep component voxels total the label",
+        sum(c[2] for c in comps) == prep["n_painted"] == 1126)
+
+    field, off, _vox, _kept = comps[0]
     chk("prep writes 100/200", set(np.unique(field)) == {100, 200})
     chk("prep marks exactly the painted voxels as inside",
         (field.view(np.int8) > 0).sum() == 1000)
     chk("prep offset places the blob correctly",
         field[tuple(np.array([15, 17, 19]) - np.array(off))] == 100)
+
+    inside = set()
+    for f, o, _v, _k in comps:
+        inside |= {tuple(np.array(p) + o) for p in zip(*np.nonzero(f.view(np.int8) > 0))}
+    chk("prep components cover the label exactly (in global coordinates)",
+        inside == set(zip(*np.nonzero(vol == 3))))
     chk("prep returns None for an absent label", XT._prep_label(vol, 99) is None)
 
-    smoothed, off_s, _, _ = XT._prep_label(vol, 3, sigma=2.0)
+    filtered = XT._prep_label(vol, 3, sigma=0.0, min_voxels=50)
+    chk("prep size filter drops debris",
+        len(filtered["components"]) == 2 and filtered["n_dropped"] == 1
+        and filtered["dropped_voxels"] == 1)
+
+    smoothed = XT._prep_label(vol, 3, sigma=1.5)
+    off_s = smoothed["components"][0][1]
     chk("prep margin grows with sigma",
-        (np.array(off) - np.array(off_s) >= 0).all() and smoothed.shape > field.shape)
+        (np.array(off) - np.array(off_s) > 0).all()
+        and smoothed["components"][0][0].shape > field.shape)
+    s = smoothed["components"][0][0].view(np.int8)
     chk("smoothed field is signed either side of the boundary",
-        (smoothed.view(np.int8) > 0).any() and (smoothed.view(np.int8) < 0).any())
+        (s > 0).any() and (s < 0).any())
+    chk("prep skips components the blur erases (1-voxel speck at sigma 1.5)",
+        len(smoothed["components"]) == 2 and smoothed["n_vanished"] == 1
+        and smoothed["vanished_voxels"] == 1)
+
+    # Isolation: two blobs 3 voxels apart, blurred.  Each component's field must stay on
+    # its own side of the gap (no neighbour tail leaking positive voxels into the crop)
+    # and fall back to "outside" before its crop border on every face.
+    close = np.zeros((30, 20, 20), np.uint16)
+    close[5:10, 5:15, 5:15] = 7
+    close[13:18, 5:15, 5:15] = 7
+    sp = XT._prep_label(close, 7, sigma=1.5)
+    chk("prep splits blobs closer than the blur reach", len(sp["components"]) == 2)
+    positives, sides, borders_ok = [], [], True
+    for f, o, _v, _k in sp["components"]:
+        s = f.view(np.int8)
+        borders_ok &= bool((s[0] <= 0).all() and (s[-1] <= 0).all()
+                           and (s[:, 0] <= 0).all() and (s[:, -1] <= 0).all()
+                           and (s[:, :, 0] <= 0).all() and (s[:, :, -1] <= 0).all())
+        P = {tuple(np.array(p) + o) for p in zip(*np.nonzero(s > 0))}
+        positives.append(P)
+        xs = {p[0] for p in P}
+        sides.append("lo" if max(xs) < 12 else ("hi" if min(xs) > 11 else "mixed"))
+    chk("prep smoothing keeps components isolated",
+        set(sides) == {"lo", "hi"} and not (positives[0] & positives[1]))
+    chk("prep smoothed fields are outside at every crop border", borders_ok)
 
 
 def main() -> int:
@@ -210,6 +314,7 @@ def main() -> int:
     test_field_extents(chk)
     test_smoothing(chk)
     test_octree_maths(chk)
+    test_components(chk)
     test_prep_label(chk)
     return chk.done()
 

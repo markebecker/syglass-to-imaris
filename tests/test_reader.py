@@ -81,11 +81,14 @@ def test_uniform(chk) -> None:
 
     # Erasing sentinels must not change the meshed surface: a sentinel reads as
     # "not this label" exactly as a zero does.
-    field, off, n_painted, _ = XT._prep_label(vol, 1, sigma=0.0)
+    prep = XT._prep_label(vol, 1, sigma=0.0)
+    chk("uniform: the blob is a single component", prep["n_components"] == 1)
+    field, off, _vox, _kept = prep["components"][0]
     with_sent = vol.copy(); with_sent[4, 4, 3] = SENTINEL_A
-    field2, off2, _, _ = XT._prep_label(with_sent, 1, sigma=0.0)
+    field2, off2, _, _ = XT._prep_label(with_sent, 1, sigma=0.0)["components"][0]
     chk("uniform: erasing sentinels is surface-neutral",
         off == off2 and np.array_equal(field, field2))
+    n_painted = prep["n_painted"]
     chk("uniform: painted voxel count matches the blob",
         n_painted == int((expected == 1).sum()),
         f"({n_painted} vs {int((expected == 1).sum())})")
