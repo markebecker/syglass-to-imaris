@@ -125,6 +125,10 @@ _CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".import_from_syglass_xt.js
 _LOG_FH = None
 
 
+class _SykLockedError(RuntimeError):
+    """The .syk is held open by syGlass (Windows sharing violation → PermissionError)."""
+
+
 # -----------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------
@@ -239,6 +243,11 @@ def _run(imarisFile: int) -> None:
     sym_path = os.path.join(syk_dir, syk_stem + ".sym")
     _log(f"using .syk: {syk_path}")
 
+    # Fail fast on a locked .syk — before the options dialog, not after minutes of work.
+    if not _ensure_syk_readable(syk_path):
+        _log("import aborted — .syk locked by syGlass.")
+        return
+
     settings = _ask_settings()
     if settings is None:
         _log("options menu cancelled — nothing imported.")
@@ -269,12 +278,25 @@ def _run(imarisFile: int) -> None:
     t_read0 = time.time()
     # label_vol: (NX, NY, NZ) uint16, 0=background, 1..N=label.
     # clip_info: (vx0, vy0, vz0, full_nx, full_ny, full_nz) — the sub-region that was read.
-    label_vol, clip_info = _read_mask_from_syk(syk_path, diagnostics=settings["diagnostics"],
-                                               trim=settings["trim"])
+    # syGlass can re-acquire the lock between the pre-flight check and here, so the read
+    # itself sits in the same retry loop.
+    while True:
+        try:
+            label_vol, clip_info = _read_mask_from_syk(syk_path,
+                                                       diagnostics=settings["diagnostics"],
+                                                       trim=settings["trim"])
+            break
+        except _SykLockedError:
+            if not _ensure_syk_readable(syk_path):
+                prog.close()
+                _log_warning("The .syk is locked by syGlass — close the project "
+                             "(or exit syGlass entirely) and re-run the import.")
+                return
 
     if label_vol is None or not np.any(label_vol):
         prog.close()
-        _log_warning("No mask data found in .syk file (or file is empty).")
+        _log_warning("No mask data found in .syk (file empty or unparseable) — "
+                     "see the log for details.")
         return
     _log(f"mask read in {time.time() - t_read0:.1f}s")
 
@@ -570,7 +592,8 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
 
     Returns ((NX, NY, NZ) uint16 array, clip_info) where
       clip_info = (vx0, vy0, vz0, full_nx, full_ny, full_nz)
-    or (None, None) on failure.
+    or (None, None) on failure.  Raises _SykLockedError if the file is held open by
+    syGlass, so the caller can offer a retry instead of reporting an empty file.
     """
     try:
         syk_size = os.path.getsize(syk_path)
@@ -723,9 +746,8 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
         return vol, clip_info
 
     except PermissionError as exc:
-        _log(f".syk parse failed: {exc}")
-        _log("NOTE: the .syk is locked by syGlass — close the project in syGlass and retry.")
-        return None, None
+        _log(f".syk locked (sharing violation): {exc}")
+        raise _SykLockedError(syk_path) from exc
     except Exception:
         _log(f".syk parse failed:\n{traceback.format_exc()}")
         return None, None
@@ -1174,6 +1196,51 @@ def _resolve_syk_path(ims_dir: str, ims_stem: str) -> str | None:
 
     _log(f"no .syk next to the .ims (looked for {cand}); opening file picker.")
     return _ask_for_syk(ims_dir)
+
+
+def _syk_is_locked(path: str) -> bool:
+    """
+    True if the .syk cannot be opened for reading — on Windows that is syGlass holding
+    the file (sharing violation surfaces as PermissionError).  GUI-free so it is testable
+    without a display.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+        return False
+    except PermissionError:
+        return True
+
+
+def _ensure_syk_readable(path: str) -> bool:
+    """
+    Block until the .syk is readable or the user gives up.  Returns True when readable.
+
+    While the file is locked, shows a Retry/Cancel dialog so the user can close the
+    project in syGlass without restarting the XTension.  The wording covers both lock
+    states seen in the wild: syGlass sometimes keeps the .syk handle open after the
+    project itself is closed, in which case only exiting syGlass releases it.
+    """
+    msg = (f"The .syk file is locked by syGlass:\n\n{path}\n\n"
+           "Close the project in syGlass, then press Retry.\n"
+           "If it still fails after closing the project, exit syGlass entirely "
+           "and press Retry.")
+    while _syk_is_locked(path):
+        _warn(f".syk locked by syGlass: {path}")
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            retry = messagebox.askretrycancel("Import from syGlass", msg, parent=root)
+            root.destroy()
+        except Exception as exc:
+            _log(f"retry dialog unavailable ({exc}); giving up on the locked .syk. {msg}")
+            return False
+        if not retry:
+            return False
+    return True
 
 
 def _ask_for_syk(initialdir: str) -> str | None:
