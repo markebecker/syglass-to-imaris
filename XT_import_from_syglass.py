@@ -215,7 +215,7 @@ def _run(imarisFile: int) -> None:
     # ----------------------------------------------------------------
     ims_path = vApp.GetCurrentFileName()
     if not ims_path:
-        _log_warning("No file is currently open in Imaris.")
+        _warn_dialog("No file is currently open in Imaris.")
         return
 
     ims_dir  = os.path.dirname(ims_path)
@@ -226,7 +226,7 @@ def _run(imarisFile: int) -> None:
     # elsewhere or be named differently from the .ims).
     syk_path = _resolve_syk_path(ims_dir, ims_stem)
     if not syk_path or not os.path.exists(syk_path):
-        _log_warning("No .syk file selected — aborting import.")
+        _warn_dialog("No .syk file selected — aborting import.")
         return
 
     _log(f"using .syk: {syk_path}")
@@ -248,7 +248,6 @@ def _run(imarisFile: int) -> None:
     # 2. Read image dimensions and physical extents from Imaris
     # ----------------------------------------------------------------
     geom = _Geometry(vApp.GetDataSet())
-    _log("Importing your syglass mask...")
     for line in geom.describe():
         _log(line)
     if geom.size_t > 1:
@@ -277,13 +276,13 @@ def _run(imarisFile: int) -> None:
         except _SykLockedError:
             if not _ensure_syk_readable(syk_path):
                 prog.close()
-                _log_warning("The .syk is locked by syGlass — close the project "
+                _warn_dialog("The .syk is locked by syGlass — close the project "
                              "(or exit syGlass entirely) and re-run the import.")
                 return
 
     if label_vol is None or not np.any(label_vol):
         prog.close()
-        _log_warning("No mask data found in .syk (file empty or unparseable) — "
+        _warn_dialog("No mask data found in .syk (file empty or unparseable) — "
                      "see the log for details.")
         return
     _log(f"mask read in {time.time() - t_read0:.1f}s")
@@ -299,7 +298,7 @@ def _run(imarisFile: int) -> None:
     _log(f"Found {len(label_ids)} labels: {label_ids}")
     if not label_ids:
         prog.close()
-        _log_warning("The .syk contains voxel data but no usable label IDs — nothing to mesh.")
+        _warn_dialog("The .syk contains voxel data but no usable label IDs — nothing to mesh.")
         return
     prog.start_labels(len(label_ids))
 
@@ -1706,11 +1705,14 @@ class _Progress:
 # Utility
 # -----------------------------------------------------------------------
 
-def _log_warning(message: str) -> None:
-    """Show a warning dialog and log the same message."""
+def _warn_dialog(message: str) -> None:
+    """
+    Show a modal warning dialog AND log the message.  Contrast with _warn, which only
+    logs — anything the user must see without opening the log belongs here.
+    """
     _warn(message)
     try:
         import tkinter.messagebox
-        tkinter.messagebox.showwarning("Import from Syglass:", message)
+        tkinter.messagebox.showwarning("Import from syGlass", message)
     except Exception:
         pass
