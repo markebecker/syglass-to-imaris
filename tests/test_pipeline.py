@@ -266,11 +266,6 @@ def test_prep_label(chk) -> None:
         inside == set(zip(*np.nonzero(vol == 3))))
     chk("prep returns None for an absent label", XT._prep_label(vol, 99) is None)
 
-    filtered = XT._prep_label(vol, 3, sigma=0.0, min_voxels=50)
-    chk("prep size filter drops debris",
-        len(filtered["components"]) == 2 and filtered["n_dropped"] == 1
-        and filtered["dropped_voxels"] == 1)
-
     smoothed = XT._prep_label(vol, 3, sigma=1.5)
     off_s = smoothed["components"][0][1]
     chk("prep margin grows with sigma",

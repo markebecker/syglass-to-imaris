@@ -28,9 +28,8 @@ Masks:
   3. Call ISurfaces.AddSurface once per component, all into ONE ISurfaces item per
      label: the scene tree shows one entry per label, but inside it every component is
      its own surface object, so debris is selectable and size-filterable in Imaris
-     (Filter tab, e.g. "Number of Voxels").  An optional minimum object size drops
-     debris before upload instead.  Prep for the next label runs on a worker thread
-     while the current one uploads.
+     (Filter tab, e.g. "Number of Voxels").  Prep for the next label runs on a worker
+     thread while the current one uploads.
 
 Progress + logs:
   A tkinter window shows the estimated finish time.  A timestamped log is written to a
@@ -244,7 +243,6 @@ def _run(imarisFile: int) -> None:
         _log("options menu cancelled — nothing imported.")
         return
     _log(f"options: smoothing sigma={settings['sigma']}  "
-         f"min object size={settings['min_voxels']}  "
          f"diagnostics={settings['diagnostics']}  "
          f"block trim={settings['trim']}")
 
@@ -320,7 +318,7 @@ def _run(imarisFile: int) -> None:
     scene   = vApp.GetSurpassScene()
     try:
         _build_surfaces(factory, scene, label_vol, label_ids, geom, clip_info,
-                        settings["sigma"], settings["min_voxels"], prog, ims_stem)
+                        settings["sigma"], prog, ims_stem)
     finally:
         prog.close()
 
@@ -454,7 +452,7 @@ def _resolve_uint8_type():
 
 
 def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_info,
-                    sigma: float, min_voxels: int, prog, name_prefix: str) -> None:
+                    sigma: float, prog, name_prefix: str) -> None:
     """
     Create one ISurfaces item per label — holding one surface OBJECT per disconnected
     component — and add it to the Surpass scene.
@@ -507,7 +505,7 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
     # One worker is enough: the loop only submits the next prep after collecting the
     # current one, so at most one prep is ever in flight.
     with ThreadPoolExecutor(max_workers=1) as pool:
-        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma, min_voxels)
+        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma)
         for label_idx, label_id in enumerate(label_ids):
             tag = f"L{label_idx + 1}/{n_labels} (id {label_id})"
 
@@ -517,16 +515,15 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             t_prep = time.time() - t0
             # Kick off prep for the next label so it overlaps this label's upload.
             if label_idx + 1 < n_labels:
-                next_future = pool.submit(_prep_label, label_vol, label_ids[label_idx + 1],
-                                          sigma, min_voxels)
+                next_future = pool.submit(_prep_label, label_vol,
+                                          label_ids[label_idx + 1], sigma)
 
             if prep is None or not prep["components"]:
                 if prep is None:
                     _log(f"{tag}: empty — skipped")
                 else:
-                    _log(f"{tag}: none of the {prep['n_components']} component(s) "
-                         f"survived the size filter ({min_voxels} voxels) and blur — "
-                         f"skipped")
+                    _log(f"{tag}: all {prep['n_components']} component(s) vanished "
+                         f"under the blur — skipped")
                 prog.begin_label(label_idx, 1)
                 prog.end_label(0.0)
                 continue
@@ -534,17 +531,15 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             comps = prep["components"]
             n_comps = len(comps)
             _log(f"{tag}: {n_comps}/{prep['n_components']} component(s); "
-                 f"painted={prep['n_painted']}"
-                 + (f"; dropped {prep['n_dropped']} under {min_voxels} voxels "
-                    f"({prep['dropped_voxels']} vox)" if prep["n_dropped"] else ""))
+                 f"painted={prep['n_painted']}")
             if prep["n_vanished"]:
                 _log(f"{tag}: {prep['n_vanished']} component(s) vanished under the blur "
                      f"({prep['vanished_voxels']} vox) — too small for sigma={sigma}; "
                      f"lower the smoothing to keep them")
             if n_comps > _COMPONENT_WARN_THRESHOLD:
                 _warn(f"{tag}: {n_comps} disconnected components — one AddSurface call "
-                      f"each will be slow; consider raising the minimum object size in "
-                      f"the options menu")
+                      f"each will be slow; debris can be deleted afterwards in Imaris "
+                      f"(Filter tab, e.g. \"Number of Voxels\")")
 
             prog.begin_label(label_idx,
                              sum(_upload_ticks(*f.shape) for f, _o, _v, _k in comps))
@@ -1065,7 +1060,7 @@ def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
     return np.where(sub, 100, 200).astype(np.uint8)          # blocky, voxel fidelity
 
 
-def _prep_label(label_vol, label_id, sigma=0.0, min_voxels=0, margin=_PREP_MARGIN_VOXELS):
+def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
     """
     Build the signed uint8 fields AddSurface meshes for ONE label — one field per
     disconnected component, each cropped to its own bounding box (CPU-only, thread-safe —
@@ -1075,13 +1070,11 @@ def _prep_label(label_vol, label_id, sigma=0.0, min_voxels=0, margin=_PREP_MARGI
     Imaris; that is what lets debris be selected and size-filtered there.  Each component
     is smoothed in ISOLATION: blurring the whole label at once would leak a nearby
     component's Gaussian tail into this component's crop and mesh phantom shells there.
-    Components under `min_voxels` voxels are dropped outright.
 
     Returns None if the label is absent, else a dict:
       components:     [(field, (ox,oy,oz) offset in label_vol, comp_voxels, n_kept), …]
                       ordered largest component first
-      n_components:   component count before the size filter
-      n_dropped / dropped_voxels: what the size filter removed
+      n_components:   component count found in the label
       n_vanished / vanished_voxels: components the blur erased entirely (no voxel stayed
                       above 0.5, so there is no zero crossing to mesh) — skipped rather
                       than sent through a pointless AddSurface call
@@ -1102,11 +1095,7 @@ def _prep_label(label_vol, label_id, sigma=0.0, min_voxels=0, margin=_PREP_MARGI
     comps, n_comps = _label_components(sub)
     del sub
     sizes = np.bincount(comps.ravel())       # sizes[0] = background, ignored
-    floor = max(1, int(min_voxels))
-    keep = sorted((cid for cid in range(1, n_comps + 1) if sizes[cid] >= floor),
-                  key=lambda cid: -sizes[cid])
-    dropped_voxels = int(sum(sizes[cid] for cid in range(1, n_comps + 1)
-                             if sizes[cid] < floor))
+    keep = sorted(range(1, n_comps + 1), key=lambda cid: -sizes[cid])
 
     components = []
     n_vanished = vanished_voxels = 0
@@ -1122,7 +1111,6 @@ def _prep_label(label_vol, label_id, sigma=0.0, min_voxels=0, margin=_PREP_MARGI
         components.append((field, (lx + ox, ly + oy, lz + oz), int(sizes[cid]), n_kept))
 
     return {"components": components, "n_components": n_comps,
-            "n_dropped": n_comps - len(keep), "dropped_voxels": dropped_voxels,
             "n_vanished": n_vanished, "vanished_voxels": vanished_voxels,
             "n_painted": n_painted}
 
@@ -1359,15 +1347,11 @@ _SMOOTHING_LEVELS = [
 # values or the radio buttons won't pre-select it.
 _DEFAULT_SIGMA = 1.0
 
-# Default minimum component size (voxels).  0 keeps everything: debris can always be
-# size-filtered in Imaris afterwards, so nothing is silently dropped by default.
-_DEFAULT_MIN_COMPONENT_VOXELS = 0
-
 
 def _ask_settings() -> dict | None:
     """
-    Show an options menu (tkinter) and return {'sigma': float, 'min_voxels': int,
-    'diagnostics': bool, 'trim': (int, int, int)}, or None if the user cancelled.
+    Show an options menu (tkinter) and return {'sigma': float, 'diagnostics': bool,
+    'trim': (int, int, int)}, or None if the user cancelled.
 
     Lets the user pick a surface-smoothing preset or type a custom blur, and toggle
     troubleshooting (block diagnostics + mask preview in the log).  Defaults are FIXED
@@ -1376,7 +1360,6 @@ def _ask_settings() -> dict | None:
     hand-edited block trim — are a trap for the next user.
     """
     defaults = {"sigma": _DEFAULT_SIGMA,
-                "min_voxels": _DEFAULT_MIN_COMPONENT_VOXELS,
                 "diagnostics": False,
                 "trim": _DEFAULT_TRIM}
     try:
@@ -1426,18 +1409,14 @@ def _ask_settings() -> dict | None:
         if not is_preset:
             custom.insert(0, str(defaults["sigma"]))
 
-        tk.Label(basic, text="Minimum object size (voxels)", font=("", 10, "bold"),
-                 anchor="w").pack(fill="x", padx=14, pady=(6, 0))
-        tk.Label(basic, text="Disconnected pieces smaller than this are skipped at "
-                            "import. 0 = keep everything (each piece is still its own "
-                            "object in Imaris, so it can be size-filtered there); try 50 "
-                            "if the mask has debris speckles.",
-                 anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
-                                                                  pady=(0, 6))
-        mrow = tk.Frame(basic); mrow.pack(fill="x", padx=26, pady=(0, 12))
-        minvox_entry = tk.Entry(mrow, width=8)
-        minvox_entry.insert(0, str(defaults["min_voxels"]))
-        minvox_entry.pack(side="left")
+        # Debris is deliberately NOT filtered at import: every disconnected piece becomes
+        # its own surface object, so users size-filter interactively in Imaris (Filter
+        # tab) instead of guessing a voxel threshold here.
+        tk.Label(basic, text="Each disconnected piece becomes its own object in Imaris; "
+                            "delete debris there via the Filter tab (e.g. \"Number of "
+                            "Voxels\").",
+                 anchor="w", justify="left", wraplength=430, fg="grey").pack(
+                     fill="x", padx=14, pady=(0, 12))
 
         # ---- Advanced tab: diagnostics, block geometry ---------------------
         diag_var = tk.BooleanVar(value=defaults["diagnostics"])
@@ -1480,11 +1459,6 @@ def _ask_settings() -> dict | None:
                     _bad(f"Custom blur must be a number (got {c!r}).")
                     return
             try:
-                mv = int(minvox_entry.get().strip() or 0)
-            except ValueError:
-                _bad("Minimum object size must be a whole number of voxels, e.g. 50.")
-                return
-            try:
                 parts = [int(v) for v in trim_entry.get().replace(" ", "").split(",")]
                 if len(parts) != 3:
                     raise ValueError
@@ -1492,7 +1466,6 @@ def _ask_settings() -> dict | None:
                 _bad("Block trim must be three integers separated by commas, e.g. 3,1,1.")
                 return
             out["sigma"] = max(0.0, s_val)
-            out["min_voxels"] = max(0, mv)
             out["diagnostics"] = bool(diag_var.get())
             out["trim"] = tuple(parts)
             root.quit()

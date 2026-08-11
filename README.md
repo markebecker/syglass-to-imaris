@@ -25,7 +25,7 @@ Usage:
 1. Open the `.ims` in Imaris and run Extensions → Import from syGlass.
 2. The matching `.syk` is found automatically if it sits beside the `.ims` and shares its name; otherwise a file picker opens.
 3. Pick a surface smoothing level. "None" gives exact voxel fidelity (blocky); higher settings interpolate a smoother mesh at the cost of fine detail. The options open with fixed defaults every run — nothing is remembered from the previous user.
-4. Each label becomes one Surfaces item in the scene tree, and every disconnected piece of that label is its own surface object inside it — so small debris can be selected and deleted in Imaris afterwards (Filter tab, e.g. "Number of Voxels"). Alternatively, set "Minimum object size" in the options to drop debris below that many voxels at import.
+4. Each label becomes one Surfaces item in the scene tree, and every disconnected piece of that label is its own surface object inside it — so small debris can be selected and deleted in Imaris afterwards (Filter tab, e.g. "Number of Voxels").
 5. Surfaces are added to the Surpass scene but **not saved** — press Ctrl+S in Imaris when you are happy with them.
 
 Known limitations:
