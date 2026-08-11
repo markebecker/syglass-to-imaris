@@ -946,6 +946,12 @@ def _log_mask_projections(label_vol):
 # Per-label field construction
 # -----------------------------------------------------------------------
 
+def _padded_span(flags: np.ndarray, n: int, margin: int):
+    """First..last True index of `flags`, padded by `margin`, clamped to [0, n)."""
+    idx = np.nonzero(flags)[0]
+    return max(0, int(idx[0]) - margin), min(n, int(idx[-1]) + 1 + margin)
+
+
 def _mask_bbox(mask: np.ndarray, margin: int):
     """
     Bounding box of the True voxels, padded by `margin` and clamped to the array.
@@ -956,14 +962,34 @@ def _mask_bbox(mask: np.ndarray, margin: int):
         return None
     ys = np.any(mask, axis=(0, 2))
     zs = np.any(mask, axis=(0, 1))
+    ox, x1 = _padded_span(xs, mask.shape[0], margin)
+    oy, y1 = _padded_span(ys, mask.shape[1], margin)
+    oz, z1 = _padded_span(zs, mask.shape[2], margin)
+    return (ox, oy, oz), (x1, y1, z1)
 
-    def _span(flags, n):
-        idx = np.nonzero(flags)[0]
-        return max(0, int(idx[0]) - margin), min(n, int(idx[-1]) + 1 + margin)
 
-    ox, x1 = _span(xs, mask.shape[0])
-    oy, y1 = _span(ys, mask.shape[1])
-    oz, z1 = _span(zs, mask.shape[2])
+def _label_bbox(label_vol: np.ndarray, label_id: int, margin: int):
+    """
+    Bounding box of one label in the full volume — same contract as _mask_bbox, but
+    scanned in X slabs so no full-volume boolean is materialised.  label_vol can be
+    billions of voxels, and prep for one label runs on a worker thread while the
+    previous label uploads, so two full-volume temporaries could coexist.
+    """
+    nx, ny, nz = label_vol.shape
+    xs = np.zeros(nx, dtype=bool)
+    ys = np.zeros(ny, dtype=bool)
+    zs = np.zeros(nz, dtype=bool)
+    slab = 64
+    for x0 in range(0, nx, slab):
+        eq = label_vol[x0:x0 + slab] == label_id
+        xs[x0:x0 + eq.shape[0]] = eq.any(axis=(1, 2))
+        ys |= eq.any(axis=(0, 2))
+        zs |= eq.any(axis=(0, 1))
+    if not xs.any():
+        return None
+    ox, x1 = _padded_span(xs, nx, margin)
+    oy, y1 = _padded_span(ys, ny, margin)
+    oz, z1 = _padded_span(zs, nz, margin)
     return (ox, oy, oz), (x1, y1, z1)
 
 
@@ -1091,15 +1117,13 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
       n_painted:      voxels of this label in label_vol
     `margin` grows with sigma so the blur has room to fall back to "outside" in-crop.
     """
-    mask = label_vol == label_id
     m = max(margin, int(np.ceil(3 * sigma)) + 1)   # room for the Gaussian tail
-    bbox = _mask_bbox(mask, m)
+    bbox = _label_bbox(label_vol, label_id, m)
     if bbox is None:
         return None
     (lx, ly, lz), (x1, y1, z1) = bbox
 
-    sub = mask[lx:x1, ly:y1, lz:z1].copy()   # small crop; copy so the big bool can free
-    del mask
+    sub = label_vol[lx:x1, ly:y1, lz:z1] == label_id   # crop-sized boolean only
     n_painted = int(sub.sum())
 
     comps, n_comps = _label_components(sub)

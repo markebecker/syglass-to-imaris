@@ -231,6 +231,28 @@ def test_components(chk) -> None:
         print("skip  components scipy parity (scipy not installed)")
 
 
+def test_label_bbox(chk) -> None:
+    """
+    The slab-wise label bbox must equal the naive full-mask bbox — it exists purely to
+    avoid materialising a full-volume boolean, not to change the answer.
+    """
+    vol = np.zeros((150, 37, 23), np.uint16)      # spans >1 X slab
+    vol[10:30, 5:9, 3:7] = 1
+    vol[100:140, 20:30, 10:20] = 3                # crosses the slab boundary at x=128
+    vol[70, 18, 11] = 3
+    for lid in (1, 3):
+        got = XT._label_bbox(vol, lid, 2)
+        want = XT._mask_bbox(vol == lid, 2)
+        chk(f"label bbox matches mask bbox (label {lid})", got == want,
+            f"({got} vs {want})")
+    chk("label bbox is None for an absent label", XT._label_bbox(vol, 99, 2) is None)
+
+    corner = np.zeros((150, 20, 20), np.uint16)
+    corner[0, 0, 0] = corner[149, 19, 19] = 7
+    chk("label bbox clamps padding at the volume edges",
+        XT._label_bbox(corner, 7, 5) == ((0, 0, 0), (150, 20, 20)))
+
+
 def test_prep_label(chk) -> None:
     """
     The signed fields Imaris meshes, one per disconnected component: uint8 read as int8,
@@ -373,6 +395,7 @@ def main() -> int:
     test_smoothing(chk)
     test_octree_maths(chk)
     test_components(chk)
+    test_label_bbox(chk)
     test_prep_label(chk)
     test_eta(chk)
     return chk.done()
