@@ -109,9 +109,13 @@ _ROOT_BBOX_MARGIN_BLOCKS = 2
 _PREP_MARGIN_VOXELS = 4
 
 # Above this many components in one label, warn that per-component AddSurface calls will
-# be slow and point at the minimum-object-size option.  Log-only: a modal mid-run would
-# stall an unattended import.
+# be slow.  Log-only: a modal mid-run would stall an unattended import.
 _COMPONENT_WARN_THRESHOLD = 200
+
+# Flat ETA pad (seconds) for meshing time before any AddSurface call has been measured
+# this run.  Once one completes, the measured mean per mesh is projected instead — the
+# pad only covers the window where there is nothing to project from.
+_ETA_MESH_PAD_S = 60.0
 
 # Open log file handle (set by _setup_logging); every _log() line carries a timestamp
 # so it is clear which step consumes time.  None until setup, in which case _log()
@@ -542,7 +546,8 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                       f"(Filter tab, e.g. \"Number of Voxels\")")
 
             prog.begin_label(label_idx,
-                             sum(_upload_ticks(*f.shape) for f, _o, _v, _k in comps))
+                             sum(_upload_ticks(*f.shape) for f, _o, _v, _k in comps),
+                             n_comps)
             surfaces = factory.CreateSurfaces()
 
             t_up = t_det = 0.0
@@ -569,7 +574,9 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                 prog.detecting(ci, n_comps)
                 t0 = time.time()
                 surfaces.AddSurface(sdf_ds, 0)
-                t_det += time.time() - t0
+                dt_mesh = time.time() - t0
+                t_det += dt_mesh
+                prog.meshed(dt_mesh)
             del comps, field, prep   # free this label's fields before the next is awaited
 
             try:
@@ -1508,10 +1515,15 @@ class _Progress:
       • the per-label cycle: preparing() → [band()×N (upload) → detecting()] per
         component → end_label().
 
-    ETA is *live*: during a label's upload the current label's duration is projected from how
-    far its band ticks have progressed (elapsed / fraction_done), so even a single-label run
-    — the common case — gets a moving finish time instead of a useless "estimating…".  Labels
-    already completed contribute their measured mean for the ones still to come.
+    ETA is *live*, and accounts for upload and meshing separately — AddSurface time per
+    component is far from proportional to upload bytes, so band ticks alone undershot
+    badly on labels with many surfaces:
+      • upload remaining is projected from band-tick progress over upload-only elapsed
+        time (meshing time is subtracted out);
+      • meshing remaining is the measured mean AddSurface duration (run-wide, via
+        meshed()) times the component-meshes still to run in this label — with a flat
+        _ETA_MESH_PAD_S until the first mesh has been measured;
+      • labels already completed contribute their measured mean for the labels to come.
 
     The bar is always determinate and fills strictly left→right; it is never switched to
     indeterminate mode (AddSurface freezes the Python thread, so an animated bar would just
@@ -1524,11 +1536,16 @@ class _Progress:
         self.start = time.time()
         self.n_labels = None           # unknown until start_labels()
         self.times: list[float] = []   # durations of completed labels
+        self.mesh_times: list[float] = []  # measured AddSurface durations, run-wide
         self.cur = 0                   # current label index (0-based)
         self.cur_tick = 0
         self.cur_ticks = 1             # upload ticks declared for the current label
         self.every = 1                 # GUI-repaint throttle for the current label
         self.label_start = None        # wall time the current label's UPLOAD began
+        self.n_comps_cur = 0           # component meshes declared for the current label
+        self.comps_done = 0            # component meshes completed in the current label
+        self.mesh_elapsed_cur = 0.0    # meshing seconds spent so far in the current label
+        self.mesh_start = None         # wall time the in-flight AddSurface began
         self.ok = False
         self.root = None
         self.bar = None
@@ -1554,24 +1571,48 @@ class _Progress:
         m, s = divmod(int(max(0, secs)), 60)
         return f"{m}:{s:02d}"
 
-    def _finish(self) -> str:
-        """Estimated wall-clock finish, projecting the current label from its band progress."""
-        now = time.time()
+    def _remaining(self, now: float) -> float | None:
+        """
+        Estimated seconds of work left, or None while there is nothing to project from.
+        Pure arithmetic over the recorded state — see the class note for the model.
+        """
         per_label = (sum(self.times) / len(self.times)) if self.times else None
+        mean_mesh = (sum(self.mesh_times) / len(self.mesh_times)) if self.mesh_times else None
+        in_flight = (now - self.mesh_start) if self.mesh_start is not None else 0.0
+
+        # Meshing left in this label: the in-flight AddSurface plus one full mesh for
+        # every component not yet started.
+        comps_left = max(0, self.n_comps_cur - self.comps_done)
+        if comps_left > 0:
+            if mean_mesh is not None:
+                mesh_remaining = max(0.0, mean_mesh * comps_left - in_flight)
+            else:
+                mesh_remaining = _ETA_MESH_PAD_S     # nothing measured yet: flat pad
+        else:
+            mesh_remaining = 0.0
+
+        # Upload left, projected from band-tick progress over upload-only elapsed time
+        # (meshing seconds are subtracted so a slow mesh doesn't inflate the upload rate).
         if self.label_start is not None and self.cur_tick > 0:
             frac = min(1.0, self.cur_tick / self.cur_ticks)
-            cur_elapsed = now - self.label_start
-            remaining_cur = max(0.0, cur_elapsed / frac - cur_elapsed) if frac > 0 else None
+            up_elapsed = max(0.0, now - self.label_start - self.mesh_elapsed_cur - in_flight)
+            upload_remaining = max(0.0, up_elapsed / frac - up_elapsed) if frac > 0 else 0.0
+            remaining_cur = upload_remaining + mesh_remaining
         elif per_label is not None:
             remaining_cur = per_label            # not uploading yet; fall back to the mean
         else:
-            remaining_cur = None
-        if remaining_cur is None:
-            return "estimating…"
+            return None
         labels_left = (self.n_labels - self.cur - 1) if self.n_labels else 0
         est_rest = (per_label if per_label is not None else remaining_cur) * max(0, labels_left)
-        finish = datetime.datetime.fromtimestamp(now + remaining_cur + est_rest)
-        return "~" + finish.strftime("%H:%M:%S")
+        return remaining_cur + est_rest
+
+    def _finish(self) -> str:
+        """Estimated wall-clock finish time as a caption fragment."""
+        now = time.time()
+        rem = self._remaining(now)
+        if rem is None:
+            return "estimating…"
+        return "~" + datetime.datetime.fromtimestamp(now + rem).strftime("%H:%M:%S")
 
     def _value(self) -> int:
         if not self.n_labels:
@@ -1608,14 +1649,22 @@ class _Progress:
         self.cur_ticks = 1
         self.every = 1
         self.label_start = None
+        self.n_comps_cur = 0
+        self.comps_done = 0
+        self.mesh_elapsed_cur = 0.0
+        self.mesh_start = None
         self._label_caption("preparing (smoothing mask)…")
 
-    def begin_label(self, idx: int, ticks: int) -> None:
+    def begin_label(self, idx: int, ticks: int, n_comps: int = 0) -> None:
         self.cur = idx
         self.cur_tick = 0
         self.cur_ticks = max(1, ticks)
         self.every = max(1, self.cur_ticks // 50)   # repaint at most ~50 times per label
         self.label_start = None
+        self.n_comps_cur = n_comps
+        self.comps_done = 0
+        self.mesh_elapsed_cur = 0.0
+        self.mesh_start = None
         self._label_caption("uploading")
 
     def band(self) -> None:
@@ -1632,11 +1681,19 @@ class _Progress:
         call per component, "label complete" cannot be inferred here, so the tick count
         is deliberately NOT slammed to the label's maximum the way it once was.
         """
+        self.mesh_start = time.time()
         if comp_idx is not None and n_comps and n_comps > 1:
             self._label_caption(f"meshing surface {comp_idx + 1}/{n_comps} "
                                 f"(Imaris working)…")
         else:
             self._label_caption("meshing surface (Imaris working)…")
+
+    def meshed(self, seconds: float) -> None:
+        """One AddSurface finished; feed its measured duration into the ETA."""
+        self.mesh_times.append(seconds)
+        self.mesh_elapsed_cur += seconds
+        self.comps_done += 1
+        self.mesh_start = None
 
     def end_label(self, duration: float) -> None:
         self.times.append(duration)

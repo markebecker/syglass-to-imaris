@@ -301,6 +301,69 @@ def test_prep_label(chk) -> None:
     chk("prep smoothed fields are outside at every crop border", borders_ok)
 
 
+def test_eta(chk) -> None:
+    """
+    The ETA must account for meshing separately from upload: AddSurface time is not
+    proportional to upload bytes, so labels with many surfaces used to finish far later
+    than estimated.  _remaining is pure arithmetic over recorded state, so it is pinned
+    here without a GUI (bypassing __init__).
+    """
+    def fresh():
+        p = XT._Progress.__new__(XT._Progress)   # no GUI
+        p.start = 0.0
+        p.n_labels = 1
+        p.times = []
+        p.mesh_times = []
+        p.cur = 0
+        p.cur_tick = 0
+        p.cur_ticks = 1
+        p.label_start = None
+        p.n_comps_cur = 0
+        p.comps_done = 0
+        p.mesh_elapsed_cur = 0.0
+        p.mesh_start = None
+        return p
+
+    chk("eta: estimating before any signal", fresh()._remaining(0.0) is None)
+
+    # Mid-upload, no meshes measured yet: tick projection plus the flat pad.
+    p = fresh()
+    p.label_start = 0.0
+    p.cur_tick, p.cur_ticks = 5, 10
+    p.n_comps_cur = 4
+    rem = p._remaining(10.0)   # 10 s for half the bands -> 10 s upload left
+    chk("eta: flat mesh pad before the first measured mesh",
+        abs(rem - (10.0 + XT._ETA_MESH_PAD_S)) < 1e-6, f"(got {rem})")
+
+    # Two meshes measured at 30 s each, two left: 60 s of meshing projected, and the
+    # 60 s already spent meshing must NOT inflate the upload projection.
+    p = fresh()
+    p.label_start = 0.0
+    p.cur_tick, p.cur_ticks = 5, 10
+    p.n_comps_cur, p.comps_done = 4, 2
+    p.mesh_times = [30.0, 30.0]
+    p.mesh_elapsed_cur = 60.0
+    rem = p._remaining(70.0)   # 70 s elapsed - 60 s meshing = 10 s for half the bands
+    chk("eta: measured mean projects the remaining meshes",
+        abs(rem - (10.0 + 60.0)) < 1e-6, f"(got {rem})")
+
+    # In-flight mesh: its elapsed time counts against the mesh budget, not the upload.
+    p.mesh_start = 70.0
+    rem = p._remaining(80.0)
+    chk("eta: in-flight mesh reduces the remaining mesh budget",
+        abs(rem - (10.0 + 50.0)) < 1e-6, f"(got {rem})")
+
+    # All meshes done, all bands done: nothing remains.
+    p = fresh()
+    p.label_start = 0.0
+    p.cur_tick = p.cur_ticks = 10
+    p.n_comps_cur = p.comps_done = 2
+    p.mesh_times = [5.0, 5.0]
+    p.mesh_elapsed_cur = 10.0
+    rem = p._remaining(20.0)
+    chk("eta: nothing left after the last mesh", abs(rem) < 1e-6, f"(got {rem})")
+
+
 def main() -> int:
     chk = Checker("pipeline (NumPy paths)")
     test_upload(chk)
@@ -311,6 +374,7 @@ def main() -> int:
     test_octree_maths(chk)
     test_components(chk)
     test_prep_label(chk)
+    test_eta(chk)
     return chk.done()
 
 
