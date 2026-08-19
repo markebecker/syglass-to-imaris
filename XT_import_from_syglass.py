@@ -13,23 +13,23 @@ Usage
 Strategy
 --------
 Masks:
-  1. Parse the .syk octree directly, rather than using the `syglass` Python API (which
-     has proven to be more trouble than it seems like it would be).  Block headers are
-     scanned to inventory the octree; the root block (a whole-volume preview downsampled
-     by 2**max_level) gives a cheap bounding-box estimate; the LEAF blocks inside that box
-     — those with no stored children, which may sit above the deepest level — are then
-     read and composited.  Blocks are stored (CZ, CY, CX) and overlap their neighbours;
-     see _DEFAULT_TRIM for the per-axis overlap.
+  1. Parse the .syk octree directly, rather than going through the `syglass` Python API
+     (which turned out to be more trouble than it was worth for these files).  Block
+     headers are scanned to inventory the octree; the root block (a whole-volume preview
+     downsampled by 2**max_level) gives a cheap bounding-box estimate; the leaf blocks
+     inside that box — those with no stored children, which may sit above the deepest
+     level — are then read and composited.  Blocks are stored (CZ, CY, CX) and overlap
+     their neighbours; see _DEFAULT_TRIM for the per-axis overlap.
   2. Split each label into its disconnected components, and build a signed uint8 field
      per component, cropped to the component's bounding box (sigma <= 0: binary
      100=inside / 200=outside; sigma > 0: a clipped Gaussian gradient).  Each field is
      uploaded in bands via SetDataSubVolumeAs1DArrayBytes, each call kept under the Ice
      message limit.
-  3. Call ISurfaces.AddSurface once per component, all into ONE ISurfaces item per
-     label: the scene tree shows one entry per label, but inside it every component is
-     its own surface object, so debris is selectable and size-filterable in Imaris
-     (Filter tab, e.g. "Number of Voxels").  Prep for the next label runs on a worker
-     thread while the current one uploads.
+  3. Call ISurfaces.AddSurface once per component, all into one ISurfaces item per label:
+     the scene tree shows one entry per label, but inside it every component is its own
+     surface object, so debris is selectable and size-filterable in Imaris (Filter tab,
+     e.g. "Number of Voxels").  Prep for the next label runs on a worker thread while the
+     current one uploads.
 
 Progress + logs:
   A tkinter window shows the estimated finish time.  A timestamped log is written to a
@@ -82,17 +82,17 @@ _MAX_PLAUSIBLE_LABEL = 100
 
 # Voxels dropped from the trailing edge of each block per axis, i.e. block_dim - stride.
 #
-# Established by rendering real files and looking at the result, which is the only test
-# that proved reliable: (3,1,1) and (2,1,1) both produce clean surfaces, while (0,0,0)
-# reproduces the periodic displaced-slice artifact.  So blocks DO overlap their neighbours,
-# by 1 voxel in Y and Z and by 2-3 in X; X's exact value is not resolved because a
-# one-voxel difference in 133 is not visible.
+# Found by rendering real files and comparing the result, which turned out to be the only
+# reliable test: (3,1,1) and (2,1,1) both give clean surfaces, while (0,0,0) reproduces the
+# periodic displaced-slice artifact.  So blocks do overlap their neighbours, by 1 voxel in
+# Y and Z and by 2-3 in X; X's exact value isn't pinned down because a one-voxel difference
+# in 133 doesn't show up visually.
 #
-# Note the syGlass grid does not have to align with the .ims voxel grid — the mask is
-# scaled onto the .ims extents — so a grid slightly smaller than the image is expected and
-# is NOT evidence that these numbers are wrong.  Several attempts to infer them from file
-# structure went astray on exactly that assumption.  The options menu exposes them for
-# testing against a new file.
+# The syGlass grid doesn't have to line up with the .ims voxel grid — the mask gets scaled
+# onto the .ims extents — so a grid slightly smaller than the image is expected, not a sign
+# these numbers are wrong.  A couple of earlier attempts to infer them from file structure
+# went astray by assuming otherwise.  The options menu exposes them for testing against a
+# new file.
 _DEFAULT_TRIM = (3, 1, 1)
 
 # Extra root-level blocks of margin on each side of the estimated mask bounding box.
@@ -102,8 +102,9 @@ _ROOT_BBOX_MARGIN_BLOCKS = 2
 # room to fall back to "outside" without touching the crop wall.
 _PREP_MARGIN_VOXELS = 4
 
-# Above this many components in one label, warn that per-component AddSurface calls will
-# be slow.  Log-only: a modal mid-run would stall an unattended import.
+# Above this many components in one label, log a warning that per-component AddSurface
+# calls will be slow.  Log-only, not a dialog: a popup mid-run would stall an unattended
+# import.
 _COMPONENT_WARN_THRESHOLD = 200
 
 # Flat ETA pad (seconds) for meshing time before any AddSurface call has been measured
@@ -327,10 +328,10 @@ def _run(imarisFile: int) -> None:
         prog.close()
 
     # ----------------------------------------------------------------
-    # 5. Done — intentionally NO save.
+    # 5. Done — not saving on purpose.
     #    vApp.FileSave("", "") pops Imaris's Save dialog (empty filename) and rewrites the
     #    whole .ims (~3 min on large files).  The surfaces are already in the live Surpass
-    #    scene, so we leave saving to the user (Ctrl+S) whenever they choose.
+    #    scene, so saving is left to the user (Ctrl+S) whenever they're ready.
     # ----------------------------------------------------------------
     _log("Done — surfaces added to the scene. NOT saved: press Ctrl+S "
          "in Imaris to write them to the .ims when ready.")
@@ -389,13 +390,14 @@ def _field_extents(ds_lo, per_voxel, offset, crop):
     Physical extents (µm) to set on a crop's IDataSet so AddSurface lands the field
     exactly on the voxel grid.
 
-    AddSurface places field samples AT the extent borders: sample i sits at
+    AddSurface places field samples right on the extent borders: sample i sits at
     extMin + i·(extMax − extMin)/(size − 1)  (ISurfaces::AddSurface: "voxel size is
-    (mExtentMax - mExtentMin) / (mSize - 1)").  Field sample i holds the value at the
-    CENTER of voxel i, i.e. at lo_edge + (i + 0.5)·per_voxel, so each extent is inset by
-    half a voxel to make the two agree, giving a sample spacing of exactly per_voxel.
-    Using the raw outer edges instead stretches the surface by size/(size−1) and shifts
-    it half a voxel — worst on small crops, and different for every crop size.
+    (mExtentMax - mExtentMin) / (mSize - 1)").  But field sample i actually holds the
+    value at the center of voxel i, i.e. at lo_edge + (i + 0.5)·per_voxel — so each
+    extent needs to be inset by half a voxel to make the two line up, which gives a
+    sample spacing of exactly per_voxel.  Using the raw outer edges instead stretches
+    the surface by size/(size−1) and shifts it half a voxel — worst on small crops, and
+    a different amount for every crop size.
     """
     offset = np.asarray(offset, dtype=np.float64)
     crop = np.asarray(crop, dtype=np.float64)
@@ -458,24 +460,26 @@ def _resolve_uint8_type():
 def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_info,
                     sigma: float, prog, name_prefix: str) -> None:
     """
-    Create one ISurfaces item per label — holding one surface OBJECT per disconnected
+    Create one ISurfaces item per label — holding one surface object per disconnected
     component — and add it to the Surpass scene.
 
     AddSurface interprets the dataset as a signed field and finds the surface at the zero
     crossing (uint8 treated as signed int8: 100 → +100 inside, 200 → −56 outside), and
-    each call yields exactly one surface object however many blobs the field contains.
-    So every component gets its own IDataSet, sized to the component's OWN bounding box
-    (not the full reconstruction — which may be billions of mostly-empty voxels), and its
-    own AddSurface call; that is what makes debris individually selectable and
-    size-filterable in Imaris.  Data is uploaded in chunks kept under the Ice limit.
+    each call yields exactly one surface object no matter how many blobs the field
+    contains.  So every component gets its own IDataSet, sized to that component's own
+    bounding box (not the full reconstruction, which may be billions of mostly-empty
+    voxels), and its own AddSurface call; that's what makes debris individually
+    selectable and size-filterable in Imaris.  Data is uploaded in chunks kept under the
+    Ice limit.
 
     If per-component AddSurface round-trips ever prove too slow on debris-heavy labels,
-    the alternative is to relabel components as distinct values and make ONE
-    IImageProcessing.DetectSurfacesFromLabelImage call — but that bypasses the signed
-    field, so the surfaces come out blocky; not worth it until timing says otherwise.
+    an alternative is to relabel components as distinct values and make one
+    IImageProcessing.DetectSurfacesFromLabelImage call instead — but that bypasses the
+    signed field, so the surfaces come out blocky.  Not worth it unless timing says
+    otherwise.
 
-    Prefetch depth 1: prep for the NEXT label (crop + split + smooth + field build) runs
-    on a background thread while the main thread uploads the CURRENT one, so the
+    Prefetch depth 1: prep for the next label (crop + split + smooth + field build) runs
+    on a background thread while the main thread uploads the current one, so the
     pure-NumPy prep overlaps the serial COM I/O.
     """
     eTypeUInt8 = _resolve_uint8_type()
@@ -489,9 +493,9 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
          f"Y=[{ds_lo[1]:.1f}, {ds_hi[1]:.1f}] Z=[{ds_lo[2]:.1f}, {ds_hi[2]:.1f}]")
 
     # The syGlass grid need not match the .ims voxel grid: the mask is mapped onto the
-    # .ims EXTENTS proportionally, so syGlass is free to build its octree at whatever
-    # resolution suits it.  A ratio near but not equal to 1.0 is normal and benign; it is
-    # logged as context, not as a fault.
+    # .ims extents proportionally, so syGlass is free to build its octree at whatever
+    # resolution suits it.  A ratio near but not equal to 1.0 is normal; it's logged as
+    # context, not as a sign of a problem.
     ratios = geom.size / full_grid
     _log(f"ims/syk grid ratio: X={ratios[0]:.3f}  Y={ratios[1]:.3f}  Z={ratios[2]:.3f}")
 
@@ -760,11 +764,11 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
 
-        # Deliberately NO seam-filling pass, and don't re-add one as insurance: patching
-        # 1-voxel gaps costs ~20 s and tens of GB of temporaries, and with a correct trim
-        # the blocks join without gaps.  Gaps at block boundaries mean the trim is wrong
-        # for this file — adjust it in the options menu and verify with the seam probe
-        # below (diagnostics; a clean join reads '1111|1111').
+        # No seam-filling pass here on purpose — the block trim fix should have fixed the
+        # gap issue, and patching gaps afterward costs ~20 s and tens of GB in temporaries.
+        # If a file does show gaps at block boundaries, adjust the trim in the options
+        # menu and check with the seam probe below (diagnostics; a clean join reads
+        # '1111|1111').
         if diagnostics:
             _probe_seams(vol, ax, ay, az, (bbox_x0, bbox_y0, bbox_z0))
 
@@ -1098,14 +1102,15 @@ def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
 
 def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
     """
-    Build the signed uint8 fields AddSurface meshes for ONE label — one field per
+    Build the signed uint8 fields AddSurface meshes for one label — one field per
     disconnected component, each cropped to its own bounding box (CPU-only, thread-safe —
     no COM/Ice access).
 
     Components are separated so every AddSurface call makes its own surface object in
-    Imaris; that is what lets debris be selected and size-filtered there.  Each component
-    is smoothed in ISOLATION: blurring the whole label at once would leak a nearby
-    component's Gaussian tail into this component's crop and mesh phantom shells there.
+    Imaris; that's what lets debris be selected and size-filtered there.  Each component
+    is smoothed on its own, in isolation from the rest of the label: blurring the whole
+    label at once would leak a nearby component's Gaussian tail into this component's
+    crop and mesh phantom shells there.
 
     Returns None if the label is absent, else a dict:
       components:     [(field, (ox,oy,oz) offset in label_vol, comp_voxels, n_kept), …]
@@ -1339,9 +1344,8 @@ def _ask_for_syk(initialdir: str) -> str | None:
     """
     Open a modal file dialog for the .syk, starting in the open .ims's own directory.
 
-    It deliberately does NOT remember the last-used directory: this runs on shared core
-    workstations, where the previous user's folder is a worse starting guess than the
-    folder the current .ims came from.
+    Doesn't remember the last folder used — in a core setting, best not to carry over
+    the previous user's folder when the current .ims already points to a better guess.
     """
     try:
         import tkinter as tk
@@ -1386,10 +1390,10 @@ def _ask_settings() -> dict | None:
     'trim': (int, int, int)}, or None if the user cancelled.
 
     Lets the user pick a surface-smoothing preset or type a custom blur, and toggle
-    troubleshooting (block diagnostics + mask preview in the log).  Defaults are FIXED
-    every run rather than remembered: this runs on shared core workstations (same
-    reasoning as _ask_for_syk), where the previous user's choices — especially a
-    hand-edited block trim — are a trap for the next user.
+    troubleshooting (block diagnostics + mask preview in the log).  The dialog always
+    opens with the same defaults rather than remembering the last run — same reasoning
+    as _ask_for_syk: in a core setting, best not to carry over the previous user's
+    settings, especially a hand-edited block trim.
     """
     defaults = {"sigma": _DEFAULT_SIGMA,
                 "diagnostics": False,
@@ -1402,8 +1406,8 @@ def _ask_settings() -> dict | None:
         root.attributes("-topmost", True)
 
         # Two tabs.  Everything a normal import needs is on the first; the second holds
-        # settings that are either diagnostic or not trustworthy yet, so they stay out of
-        # the way instead of inviting people to change things they shouldn't.
+        # settings that are either diagnostic or not trustworthy yet, kept out of the
+        # way so people aren't tempted to change something usually best left alone.
         tabs = ttk.Notebook(root)
         basic = tk.Frame(tabs)
         advanced = tk.Frame(tabs)
@@ -1438,9 +1442,9 @@ def _ask_settings() -> dict | None:
         tk.Label(crow, text="…or custom blur:").pack(side="left")
         custom.pack(side="left", padx=6)
 
-        # Debris is deliberately NOT filtered at import: every disconnected piece becomes
-        # its own surface object, so users size-filter interactively in Imaris (Filter
-        # tab) instead of guessing a voxel threshold here.
+        # No debris filter at import time: every disconnected piece becomes its own
+        # surface object, so users size-filter interactively in Imaris (Filter tab)
+        # instead of guessing a voxel threshold here.
         tk.Label(basic, text="Each disconnected piece becomes its own object in Imaris; "
                             "delete debris there via the Filter tab (e.g. \"Number of "
                             "Voxels\").",
@@ -1699,9 +1703,9 @@ class _Progress:
 
     def detecting(self, comp_idx: int | None = None, n_comps: int | None = None) -> None:
         """
-        Caption only; the bar stays wherever the upload ticks left it.  cur_tick must
-        not be advanced here: more component uploads may follow in this label, and the
-        bar only reads "label complete" at end_label().
+        Caption only; the bar stays wherever the upload ticks left it.  cur_tick isn't
+        touched here, since more component uploads may still follow in this label — the
+        bar only reads "label complete" once end_label() is called.
         """
         self.mesh_start = time.time()
         if comp_idx is not None and n_comps and n_comps > 1:
@@ -1737,8 +1741,8 @@ class _Progress:
 
 def _warn_dialog(message: str) -> None:
     """
-    Show a modal warning dialog AND log the message.  Contrast with _warn, which only
-    logs — anything the user must see without opening the log belongs here.
+    Show a modal warning dialog and log the same message.  Use this instead of _warn
+    whenever the user needs to see it without having to open the log.
     """
     _warn(message)
     try:
