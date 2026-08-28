@@ -1,7 +1,7 @@
 """
 Imaris XTension: Import syGlass Masks into Imaris.
 
-Runs inside a live Imaris session.  Imaris calls XTImportFromSyGlass(imarisFile)
+Runs inside a live Imaris session. Imaris calls XTImportFromSyGlass(imarisFile)
 where imarisFile is the numeric handle for the ImarisLib COM connection.
 
 Usage
@@ -14,7 +14,7 @@ Strategy
 --------
 Masks:
   1. Parse the .syk octree directly, rather than going through the `syglass` Python API
-     (which turned out to be more trouble than it was worth for these files).  Block
+     (which turned out to be more trouble than it was worth for these files). Block
      headers are scanned to inventory the octree; the root block (a whole-volume preview
      downsampled by 2**max_level) gives a cheap bounding-box estimate; the leaf blocks
      inside that box — those with no stored children, which may sit above the deepest
@@ -22,13 +22,13 @@ Masks:
      their neighbours; see _DEFAULT_TRIM for the per-axis overlap.
   2. Split each label into its disconnected components, and build a signed uint8 field
      per component, cropped to the component's bounding box (sigma <= 0: binary
-     100=inside / 200=outside; sigma > 0: a clipped Gaussian gradient).  Each field is
+     100=inside / 200=outside; sigma > 0: a clipped Gaussian gradient). Each field is
      uploaded in bands via SetDataSubVolumeAs1DArrayBytes, each call kept under the Ice
      message limit.
   3. Call ISurfaces.AddSurface once per component, all into one ISurfaces item per label:
      the scene tree shows one entry per label, but inside it every component is its own
      surface object, so debris is selectable and size-filterable in Imaris (Filter tab,
-     e.g. "Number of Voxels").  Prep for the next label runs on a worker thread while the
+     e.g. "Number of Voxels"). Prep for the next label runs on a worker thread while the
      current one uploads.
 
 Progress + logs:
@@ -85,8 +85,7 @@ _MAX_PLAUSIBLE_LABEL = 100
 # Found by rendering real files and comparing the result, which turned out to be the only
 # reliable test: (3,1,1) and (2,1,1) both give clean surfaces, while (0,0,0) reproduces the
 # periodic displaced-slice artifact.  So blocks do overlap their neighbours, by 1 voxel in
-# Y and Z and by 2-3 in X; X's exact value isn't pinned down because a one-voxel difference
-# in 133 doesn't show up visually.
+# Y and Z and by 2-3 in X.
 #
 # The syGlass grid doesn't have to line up with the .ims voxel grid — the mask gets scaled
 # onto the .ims extents — so a grid slightly smaller than the image is expected, not a sign
@@ -103,8 +102,7 @@ _ROOT_BBOX_MARGIN_BLOCKS = 2
 _PREP_MARGIN_VOXELS = 4
 
 # Above this many components in one label, log a warning that per-component AddSurface
-# calls will be slow.  Log-only, not a dialog: a popup mid-run would stall an unattended
-# import.
+# calls will be slow.  Log-only, not a dialog.
 _COMPONENT_WARN_THRESHOLD = 200
 
 # Flat ETA pad (seconds) for meshing time before any AddSurface call has been measured
@@ -119,15 +117,7 @@ _LOG_FH = None
 
 
 class _SykLockedError(RuntimeError):
-    """The .syk is held open by syGlass (Windows sharing violation → PermissionError)."""
-
-
-# How to release a locked .syk — shared by the retry dialog and the give-up warning.
-# Two steps because syGlass has been seen keeping the file handle open even after the
-# project itself is closed.
-_LOCKED_SYK_HINT = ("Close the project in syGlass. If the file is still locked after "
-                    "that, exit syGlass entirely.")
-
+    """The .syk may be held open by syGlass (Windows sharing violation → PermissionError)."""
 
 # -----------------------------------------------------------------------
 # Logging
@@ -181,7 +171,7 @@ def _warn(msg: str) -> None:
 
 #   <CustomTools>
 #       <Menu>
-#           <Item name="Import from syGlass (Development)" icon="Python3"
+#           <Item name="Import from syGlass" icon="Python3"
 #                 tooltip="Import syGlass masks into the current scene as surfaces">
 #               <Command>Python3XT::XTImportFromSyGlass(%i)</Command>
 #           </Item>
@@ -284,8 +274,9 @@ def _run(imarisFile: int) -> None:
         except _SykLockedError:
             if not _ensure_syk_readable(syk_path):
                 prog.close()
-                _warn_dialog(f"The .syk is locked by syGlass. {_LOCKED_SYK_HINT} "
-                             f"Then re-run the import.")
+                _warn_dialog(f"The .syk is locked by syGlass. Close the project in syGlass. " 
+                             "If the file is still locked after that, exit syGlass entirely. "
+                             "Then re-run the import.")
                 return
 
     if label_vol is None or not np.any(label_vol):
@@ -333,7 +324,7 @@ def _run(imarisFile: int) -> None:
     #    whole .ims (~3 min on large files).  The surfaces are already in the live Surpass
     #    scene, so saving is left to the user (Ctrl+S) whenever they're ready.
     # ----------------------------------------------------------------
-    _log("Done — surfaces added to the scene. NOT saved: press Ctrl+S "
+    _log("Done — surfaces added to the scene. Press Ctrl+S "
          "in Imaris to write them to the .ims when ready.")
 
 

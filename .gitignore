@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 /logs
+/tools
+/tests
 .DS_Store
