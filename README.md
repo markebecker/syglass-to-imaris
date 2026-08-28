@@ -34,5 +34,6 @@ This XTension has been tested on Windows 11 only, with the following Imaris and 
 Performance with other versions or on other platforms may vary.
 
 Future Development:
-* Standalone app to port Imaris surfaces (or other surfaces...) into syGlass projects as masks.
-  * syGlass plugin system deprecated
+* Potentially, at some point, a standalone app to port Imaris surfaces (or other surfaces...) into syGlass projects as masks.
+
+License: [GPL-3.0](LICENSE)

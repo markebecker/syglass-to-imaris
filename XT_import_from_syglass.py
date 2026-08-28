@@ -46,6 +46,13 @@ Troubleshooting:
     - If the import appears hung, check Task Manager: both Python and Imaris should show CPU activity while surfaces are built.
 
 Python 3.11 compatibility required (Imaris bundled interpreter).
+
+Copyright (C) 2026 Mark Becker
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See the LICENSE file for details.
 """
 
 from __future__ import annotations
