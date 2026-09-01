@@ -5,7 +5,7 @@ Imaris XTension to convert syGlass masks to Imaris surfaces.
 ## Installation:
 1. In Imaris, navigate to CustomTools Preferences.
 2. Ensure that a valid python.exe is selected. For Imaris 11, it must be Python 3.11; for Imaris 10, Python 3.7.
-3. Install the plugin: Download `XT_import_from_syglass.py` and copy it to a CustomTools directory.  Alternatively, `git pull` this repository to the path of your choice and add that path to the list of CustomTools Python XTension directories.
+3. Install the plugin: Download `XT_import_from_syglass.py` and copy it to a CustomTools directory.  Alternatively, `git clone` this repository to the path of your choice and add that path to the list of CustomTools Python XTension directories.
 
 ### Dependencies:
 * `numpy` — required.
