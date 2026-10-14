@@ -16,9 +16,10 @@ Masks:
   1. Parse the .syk octree directly, rather than going through the `syglass` Python API
      (which turned out to be more trouble than it was worth for these files). Block
      headers are scanned to inventory the octree; the root block (a whole-volume preview
-     downsampled by 2**max_level) gives a cheap bounding-box estimate; the leaf blocks
-     inside that box — those with no stored children, which may sit above the deepest
-     level — are then read and composited.  Blocks are stored (CZ, CY, CX) and overlap
+     downsampled by 2**max_level) gives a cheap bounding-box estimate; every region inside
+     that box with no stored finer block — whole childless blocks, or the octants of a
+     partly subdivided one, either of which may sit above the deepest level — is then
+     read and composited.  Blocks are stored (CZ, CY, CX) and overlap
      their neighbours; see _DEFAULT_TRIM for the per-axis overlap.
   2. Split each label into its disconnected components, and build a signed uint8 field
      per component, cropped to the component's bounding box (sigma <= 0: binary
@@ -623,9 +624,9 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
     Read the syGlass label mask from a .syk file.
 
     Scans all block headers to inventory the octree, reads the root block to
-    estimate the mask bounding box, then composites every LEAF block (childless,
-    at whatever level it sits — coarse leaves are upsampled) that falls within
-    that bbox.  Reading only the bbox avoids allocating the full (potentially
+    estimate the mask bounding box, then composites, within that bbox, every
+    region that has no stored finer block: childless blocks whole, and the
+    child-less octants of partly subdivided ones (coarse data is upsampled).  Reading only the bbox avoids allocating the full (potentially
     huge) reconstructed volume.
 
     Returns ((NX, NY, NZ) uint16 array, clip_info) where
@@ -683,7 +684,7 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
         # this halves the footprint of the volume and the bandwidth of every scan over it.
         vol = np.zeros((clip_nx, clip_ny, clip_nz), dtype=np.uint16)
 
-        # Pass 2 — place every LEAF block within the bbox.
+        # Pass 2 — place every region within the bbox that has no stored finer block.
         #
         # The octree is adaptive: a block whose children are absent from the file is a leaf
         # holding its region's mask at its own (coarser) resolution.  Reading only the
@@ -693,19 +694,27 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
         # deepest level and read correctly either way.  tools/octree_structure.py reports
         # which shape a file has.
         #
-        # A leaf at level L is coarser than the finest grid by scale = 2**(max_level - L),
+        # A block can also be partly subdivided: children stored for some octants and not
+        # others.  The octants without a stored child exist only in that coarse block, so
+        # they are painted from it; skipping the whole block because it has any children
+        # cut the mask off at block boundaries on a real file.  A childless block is the
+        # case where all eight octants come from the block itself.
+        #
+        # A block at level L is coarser than the finest grid by scale = 2**(max_level - L),
         # so each of its voxels covers a scale**3 cube and is expanded on placement.
-        has_child = set()
+        children = {}
         for bid in block_offset:
             if bid:
-                has_child.add((bid - 1) // 8)
+                children.setdefault((bid - 1) // 8, set()).add((bid - 1) % 8)
 
         with open(syk_path, "rb") as f:
             n_placed = 0
+            n_partial = 0
             n_sentinel = 0
             per_level = {}
             for bid, boff in block_offset.items():
-                if bid in has_child:
+                stored = children.get(bid, set())
+                if len(stored) == 8:
                     continue                      # interior node: its children hold the data
                 lv, ix, iy, iz = _syk_block_position(bid)
                 scale = 1 << (max_level - lv)     # finest voxels per voxel of this block
@@ -729,42 +738,70 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
                 arr = (np.frombuffer(raw, dtype="<u2")
                        .reshape(cz, cy, cx)[:az, :ay, :ax]
                        .transpose(2, 1, 0))   # (ax, ay, az), uint16
-                if scale > 1:
-                    arr = arr.repeat(scale, 0).repeat(scale, 1).repeat(scale, 2)
 
-                # Sub-range of this block that falls inside the clipped volume, and where
-                # it lands.  Named src_/dst_ rather than c*/d* because cx, cy, cz are the
-                # block dimensions and in scope here.
-                src_x0 = max(0, bbox_x0 - bx0);  src_x1 = min(span_x, bbox_x1 - bx0)
-                src_y0 = max(0, bbox_y0 - by0);  src_y1 = min(span_y, bbox_y1 - by0)
-                src_z0 = max(0, bbox_z0 - bz0);  src_z1 = min(span_z, bbox_z1 - bz0)
+                # Regions of this block to paint, in block-local finest-grid voxels: the
+                # whole block for a leaf, else each octant with no stored child.  A block
+                # with children sits above max_level, so scale >= 2 and the halves are exact.
+                if not stored:
+                    regions = [((0, span_x), (0, span_y), (0, span_z))]
+                else:
+                    hx, hy, hz = span_x // 2, span_y // 2, span_z // 2
+                    regions = [((hx * (o & 1), hx * (o & 1) + hx),
+                                (hy * (o >> 1 & 1), hy * (o >> 1 & 1) + hy),
+                                (hz * (o >> 2 & 1), hz * (o >> 2 & 1) + hz))
+                               for o in range(8) if o not in stored]
+                    n_partial += 1
 
-                dst_x0 = bx0 + src_x0 - bbox_x0;  dst_x1 = dst_x0 + (src_x1 - src_x0)
-                dst_y0 = by0 + src_y0 - bbox_y0;  dst_y1 = dst_y0 + (src_y1 - src_y0)
-                dst_z0 = bz0 + src_z0 - bbox_z0;  dst_z1 = dst_z0 + (src_z1 - src_z0)
+                for (rx0, rx1), (ry0, ry1), (rz0, rz1) in regions:
+                    # Clip the region to the bbox, still block-local.  Named src_/dst_
+                    # rather than c*/d* because cx, cy, cz are the block dimensions and in
+                    # scope here.
+                    src_x0 = max(rx0, bbox_x0 - bx0);  src_x1 = min(rx1, bbox_x1 - bx0)
+                    src_y0 = max(ry0, bbox_y0 - by0);  src_y1 = min(ry1, bbox_y1 - by0)
+                    src_z0 = max(rz0, bbox_z0 - bz0);  src_z1 = min(rz1, bbox_z1 - bz0)
+                    if src_x0 >= src_x1 or src_y0 >= src_y1 or src_z0 >= src_z1:
+                        continue
 
-                dst = vol[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1]   # view into vol
-                dst[...] = arr[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
+                    # Crop at the block's own resolution before upsampling, so a coarse
+                    # block near the root never expands to its full finest-grid size.
+                    piece = arr[src_x0 // scale:-(-src_x1 // scale),
+                                src_y0 // scale:-(-src_y1 // scale),
+                                src_z0 // scale:-(-src_z1 // scale)]
+                    if scale > 1:
+                        piece = piece.repeat(scale, 0).repeat(scale, 1).repeat(scale, 2)
+                        ox, oy, oz = src_x0 % scale, src_y0 % scale, src_z0 % scale
+                        piece = piece[ox:ox + src_x1 - src_x0,
+                                      oy:oy + src_y1 - src_y0,
+                                      oz:oz + src_z1 - src_z0]
 
-                # Erase implausible label IDs as each block lands.  Cheap (one pass over a
-                # block-sized view) and it keeps a phantom "label 18024" out of the
-                # inventory.  A sentinel reads as "not this label" whether erased or left
-                # in place, so this neither creates nor closes a hole in any surface.
-                bad = dst > _MAX_PLAUSIBLE_LABEL
-                n_bad = int(bad.sum())
-                if n_bad:
-                    dst[bad] = 0
-                    n_sentinel += n_bad
+                    dst_x0 = bx0 + src_x0 - bbox_x0;  dst_x1 = dst_x0 + (src_x1 - src_x0)
+                    dst_y0 = by0 + src_y0 - bbox_y0;  dst_y1 = dst_y0 + (src_y1 - src_y0)
+                    dst_z0 = bz0 + src_z0 - bbox_z0;  dst_z1 = dst_z0 + (src_z1 - src_z0)
+
+                    dst = vol[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1]   # view into vol
+                    dst[...] = piece
+
+                    # Erase implausible label IDs as each region lands.  Cheap (one pass
+                    # over a block-sized view) and it keeps a phantom "label 18024" out of
+                    # the inventory.  A sentinel reads as "not this label" whether erased
+                    # or left in place, so this neither creates nor closes a hole in any
+                    # surface.
+                    bad = dst > _MAX_PLAUSIBLE_LABEL
+                    n_bad = int(bad.sum())
+                    if n_bad:
+                        dst[bad] = 0
+                        n_sentinel += n_bad
                 n_placed += 1
                 per_level[lv] = per_level.get(lv, 0) + 1
 
         levels_txt = ", ".join(f"L{lv}:{n}" for lv, n in sorted(per_level.items()))
-        _log(f".syk: placed {n_placed} leaf block(s) — {levels_txt}"
+        _log(f".syk: placed {n_placed} block(s) — {levels_txt}"
              f"  (deepest level {max_level}, {n_grid ** 3} slots)")
         if any(lv < max_level for lv in per_level):
             coarse = sum(n for lv, n in per_level.items() if lv < max_level)
-            _log(f".syk: adaptive octree — {coarse} leaf block(s) sit above the deepest "
-                 f"level and were upsampled into place")
+            _log(f".syk: adaptive octree — {coarse} block(s) sit above the deepest "
+                 f"level and were upsampled into place, {n_partial} of them only in the "
+                 f"octants with no stored child")
         if n_sentinel:
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
