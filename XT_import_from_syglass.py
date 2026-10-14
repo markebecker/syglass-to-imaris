@@ -126,6 +126,14 @@ _LOG_FH = None
 class _SykLockedError(RuntimeError):
     """The .syk may be held open by syGlass (Windows sharing violation → PermissionError)."""
 
+
+# How to release a locked .syk — shared by the retry dialog and the give-up warning.
+# Two steps because syGlass has been seen keeping the file handle open even after the
+# project itself is closed.
+_LOCKED_SYK_HINT = ("Close the project in syGlass. If the file is still locked after "
+                    "that, exit syGlass entirely.")
+
+
 # -----------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------
@@ -281,9 +289,8 @@ def _run(imarisFile: int) -> None:
         except _SykLockedError:
             if not _ensure_syk_readable(syk_path):
                 prog.close()
-                _warn_dialog(f"The .syk is locked by syGlass. Close the project in syGlass. " 
-                             "If the file is still locked after that, exit syGlass entirely. "
-                             "Then re-run the import.")
+                _warn_dialog(f"The .syk is locked by syGlass. {_LOCKED_SYK_HINT} "
+                             f"Then re-run the import.")
                 return
 
     if label_vol is None or not np.any(label_vol):
