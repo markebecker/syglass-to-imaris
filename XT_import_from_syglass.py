@@ -19,7 +19,7 @@ Masks:
      downsampled by 2**max_level) gives a cheap bounding-box estimate; every region inside
      that box with no stored finer block — whole childless blocks, or the octants of a
      partly subdivided one, either of which may sit above the deepest level — is then
-     read and composited.  Blocks are stored (CZ, CY, CX) and overlap
+     read and composited; empty placeholder blocks don't count as stored.  Blocks are stored (CZ, CY, CX) and overlap
      their neighbours; see _DEFAULT_TRIM for the per-axis overlap.
   2. Split each label into its disconnected components, and build a signed uint8 field
      per component, cropped to the component's bounding box (sigma <= 0: binary
@@ -700,44 +700,88 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
         # cut the mask off at block boundaries on a real file.  A childless block is the
         # case where all eight octants come from the block itself.
         #
+        # syGlass also stores empty placeholder blocks: no mask voxel at all, under a parent
+        # whose matching octant does hold mask.  Parents otherwise track their children
+        # closely (a parent octant is close to a downsample of its child), so an empty
+        # child is not an erasure — treating it as authoritative left a whole block row of
+        # a real file blank.  Such placeholders are therefore transparent: they paint
+        # nothing and do not count as stored children, so their region comes from the
+        # nearest non-empty ancestor.  Blocks are painted coarse to fine, so a non-empty
+        # block below a placeholder still overwrites the ancestor's data in its region.
+        #
         # A block at level L is coarser than the finest grid by scale = 2**(max_level - L),
         # so each of its voxels covers a scale**3 cube and is expanded on placement.
-        children = {}
+        def read_block(f, boff):
+            f.seek(boff + 24)
+            raw = f.read(block_payload)
+            # Stored (cz, cy, cx).  Keep the leading (ax, ay, az) voxels — the trailing
+            # `trim` slices per axis are dropped as overlap/padding — then transpose to the
+            # (X, Y, Z) convention.
+            return (np.frombuffer(raw, dtype="<u2")
+                    .reshape(cz, cy, cx)[:az, :ay, :ax]
+                    .transpose(2, 1, 0))   # (ax, ay, az), uint16
+
+        # Geometry of every block that overlaps the bbox, in finest-grid voxels.  A child
+        # outside the bbox has a parent octant outside it too, so nothing else matters.
+        geom = {}
         for bid in block_offset:
-            if bid:
-                children.setdefault((bid - 1) // 8, set()).add((bid - 1) % 8)
+            lv, ix, iy, iz = _syk_block_position(bid)
+            scale = 1 << (max_level - lv)     # finest voxels per voxel of this block
+            span_x, span_y, span_z = ax * scale, ay * scale, az * scale
+            bx0, by0, bz0 = ix * span_x, iy * span_y, iz * span_z
+            if bx0 + span_x <= bbox_x0 or bx0 >= bbox_x1: continue
+            if by0 + span_y <= bbox_y0 or by0 >= bbox_y1: continue
+            if bz0 + span_z <= bbox_z0 or bz0 >= bbox_z1: continue
+            geom[bid] = (lv, scale, (span_x, span_y, span_z), (bx0, by0, bz0))
+
+        def has_mask(a):
+            return bool(((a > 0) & (a <= _MAX_PLAUSIBLE_LABEL)).any())
 
         with open(syk_path, "rb") as f:
+            empty = {bid for bid in geom if not has_mask(read_block(f, block_offset[bid]))}
+
+            # An empty block is a placeholder only if its nearest non-empty ancestor has
+            # mask in the voxels that lie wholly inside the block's region.  The trimmed
+            # block size is odd, so an ancestor voxel can straddle the region's edge and
+            # carry mask from next door; counting those would turn a genuinely empty
+            # block into a one-voxel sheet along its face.
+            ancestor_cache = {}
+            placeholder = set()
+            for bid in empty:
+                anc = bid
+                while anc:
+                    anc = (anc - 1) // 8
+                    if anc in geom and anc not in empty:
+                        break
+                else:
+                    continue                      # no non-empty ancestor: root is empty
+                if anc not in ancestor_cache:
+                    ancestor_cache[anc] = read_block(f, block_offset[anc])
+                _, a_scale, _, a_org = geom[anc]
+                _, _, spans, org = geom[bid]
+                inner = tuple(slice(-(-(o - ao) // a_scale), (o + s - ao) // a_scale)
+                              for o, s, ao in zip(org, spans, a_org))
+                if has_mask(ancestor_cache[anc][inner]):
+                    placeholder.add(bid)
+            ancestor_cache.clear()
+
+            children = {}
+            for bid in geom:
+                if bid and bid not in placeholder:
+                    children.setdefault((bid - 1) // 8, set()).add((bid - 1) % 8)
+
             n_placed = 0
             n_partial = 0
             n_sentinel = 0
             per_level = {}
-            for bid, boff in block_offset.items():
+            for bid in sorted(geom, key=lambda b: geom[b][0]):
+                if bid in placeholder:
+                    continue                      # its ancestor holds the data
                 stored = children.get(bid, set())
                 if len(stored) == 8:
                     continue                      # interior node: its children hold the data
-                lv, ix, iy, iz = _syk_block_position(bid)
-                scale = 1 << (max_level - lv)     # finest voxels per voxel of this block
-                span_x = ax * scale      # extent of this block in finest-grid voxels
-                span_y = ay * scale
-                span_z = az * scale
-
-                bx0, bx1 = ix * span_x, ix * span_x + span_x
-                by0, by1 = iy * span_y, iy * span_y + span_y
-                bz0, bz1 = iz * span_z, iz * span_z + span_z
-
-                if bx1 <= bbox_x0 or bx0 >= bbox_x1: continue
-                if by1 <= bbox_y0 or by0 >= bbox_y1: continue
-                if bz1 <= bbox_z0 or bz0 >= bbox_z1: continue
-
-                f.seek(boff + 24)
-                raw = f.read(block_payload)
-                # Stored (cz, cy, cx).  Keep the leading (ax, ay, az) voxels — the trailing
-                # `trim` slices per axis are dropped as overlap/padding — then transpose to
-                # the (X, Y, Z) convention.
-                arr = (np.frombuffer(raw, dtype="<u2")
-                       .reshape(cz, cy, cx)[:az, :ay, :ax]
-                       .transpose(2, 1, 0))   # (ax, ay, az), uint16
+                lv, scale, (span_x, span_y, span_z), (bx0, by0, bz0) = geom[bid]
+                arr = read_block(f, block_offset[bid])
 
                 # Regions of this block to paint, in block-local finest-grid voxels: the
                 # whole block for a leaf, else each octant with no stored child.  A block
@@ -802,6 +846,9 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             _log(f".syk: adaptive octree — {coarse} block(s) sit above the deepest "
                  f"level and were upsampled into place, {n_partial} of them only in the "
                  f"octants with no stored child")
+        if placeholder:
+            _log(f".syk: skipped {len(placeholder)} empty placeholder block(s); their "
+                 f"regions come from the nearest non-empty ancestor")
         if n_sentinel:
             _log(f".syk: erased {n_sentinel} sentinel voxel(s) with IDs > "
                  f"{_MAX_PLAUSIBLE_LABEL} before meshing")
