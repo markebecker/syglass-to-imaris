@@ -75,10 +75,12 @@ import numpy as np
 # SciPy is optional and imported once here.  If the import fails, the NumPy fallbacks
 # are used and _run writes the reason to the log.
 try:
+    from scipy.ndimage import find_objects as _scipy_find_objects
     from scipy.ndimage import gaussian_filter as _scipy_gaussian_filter
     from scipy.ndimage import label as _scipy_label
     _SCIPY_IMPORT_ERROR = None
 except ImportError as _scipy_exc:
+    _scipy_find_objects = None
     _scipy_gaussian_filter = None
     _scipy_label = None
     _SCIPY_IMPORT_ERROR = _scipy_exc
@@ -1221,6 +1223,45 @@ def _mask_bbox(mask: np.ndarray, margin: int):
     return (ox, oy, oz), (x1, y1, z1)
 
 
+def _component_boxes(comps: np.ndarray, n_comps: int, margin: int) -> list:
+    """
+    Bounding box of every component in `comps` (labels 1..n_comps), padded by `margin`
+    and clamped to the array, in the same form as _mask_bbox.  Entry i is component
+    i + 1.  Every component appears at least once in `comps`, so no entry is empty.
+    """
+    if _scipy_find_objects is not None:
+        slices = _scipy_find_objects(comps, max_label=n_comps)
+        lows = [[axis_slice.start for axis_slice in box] for box in slices]
+        highs = [[axis_slice.stop for axis_slice in box] for box in slices]
+    else:
+        lows, highs = _component_spans_numpy(comps, n_comps)
+
+    boxes = []
+    for low, high in zip(lows, highs):
+        padded_low = tuple(max(0, int(start) - margin) for start in low)
+        padded_high = tuple(min(size, int(stop) + margin)
+                            for stop, size in zip(high, comps.shape))
+        boxes.append((padded_low, padded_high))
+    return boxes
+
+
+def _component_spans_numpy(comps: np.ndarray, n_comps: int):
+    """
+    Per-component first and exclusive last index along each axis, without SciPy.
+    Returns (lows, highs), each a list of [x, y, z] per component.
+    """
+    nx, ny, nz = comps.shape
+    flat = np.flatnonzero(comps)
+    component_index = comps.ravel()[flat] - 1
+    coordinates = (flat // (ny * nz), (flat // nz) % ny, flat % nz)
+    lows = np.full((n_comps, 3), np.iinfo(np.int64).max, dtype=np.int64)
+    highs = np.zeros((n_comps, 3), dtype=np.int64)
+    for axis, coordinate in enumerate(coordinates):
+        np.minimum.at(lows[:, axis], component_index, coordinate)
+        np.maximum.at(highs[:, axis], component_index, coordinate + 1)
+    return lows.tolist(), highs.tolist()
+
+
 def _label_bbox(label_vol: np.ndarray, label_id: int, margin: int):
     """
     Bounding box of one label in the full volume — same contract as _mask_bbox, but
@@ -1386,15 +1427,20 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS,
     sizes = np.bincount(comps.ravel())       # sizes[0] = background, ignored
     keep = sorted(range(1, n_comps + 1), key=lambda cid: -sizes[cid])
 
+    # All boxes in one pass, so each piece below only touches its own box rather than
+    # the whole label crop.
+    boxes = _component_boxes(comps, n_comps, m)
+
     components = []
     n_vanished = vanished_voxels = 0
     for piece_index, cid in enumerate(keep):
         if on_progress is not None:
             on_progress(f"Preparing piece {piece_index + 1} of {n_comps}",
                         piece_index, n_comps)
-        cmask = comps == cid                 # isolation: neighbours excluded before blur
-        (ox, oy, oz), (cx1, cy1, cz1) = _mask_bbox(cmask, m)
-        field = _signed_field(cmask[ox:cx1, oy:cy1, oz:cz1], sigma)
+        (ox, oy, oz), (cx1, cy1, cz1) = boxes[cid - 1]
+        # Isolation: other pieces that reach into this box are excluded before the blur.
+        cmask = comps[ox:cx1, oy:cy1, oz:cz1] == cid
+        field = _signed_field(cmask, sigma)
         n_kept = int((field.view(np.int8) > 0).sum())
         if n_kept == 0:                      # blur erased it: nothing crosses zero
             n_vanished += 1
