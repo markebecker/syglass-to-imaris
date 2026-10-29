@@ -68,6 +68,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+# SciPy is optional and imported once here.  If the import fails, the NumPy fallbacks
+# are used and _run writes the reason to the log.
+try:
+    from scipy.ndimage import gaussian_filter as _scipy_gaussian_filter
+    from scipy.ndimage import label as _scipy_label
+    _SCIPY_IMPORT_ERROR = None
+except ImportError as _scipy_exc:
+    _scipy_gaussian_filter = None
+    _scipy_label = None
+    _SCIPY_IMPORT_ERROR = _scipy_exc
+
 # ImarisLib — always available in Imaris's Python interpreter
 import ImarisLib  # type: ignore  # noqa: E402
 
@@ -257,6 +268,10 @@ def _run(imarisFile: int) -> None:
     _log(f"options: smoothing sigma={settings['sigma']}  "
          f"diagnostics={settings['diagnostics']}  "
          f"block trim={settings['trim']}")
+    if _SCIPY_IMPORT_ERROR is not None:
+        _warn(f"scipy could not be imported ({_SCIPY_IMPORT_ERROR}); using the NumPy "
+              f"fallbacks. Component labeling is slower, and smoothing approximates the "
+              f"Gaussian blur, so surfaces differ from a run with scipy.")
 
     # ----------------------------------------------------------------
     # 2. Read image dimensions and physical extents from Imaris
@@ -1094,11 +1109,9 @@ def _label_components(mask: np.ndarray):
     components.  Uses scipy.ndimage.label when available; otherwise the pure-NumPy
     fallback below (same contract, so the two are interchangeable).
     """
-    try:
-        from scipy.ndimage import label as nd_label
-    except ImportError:
+    if _scipy_label is None:
         return _label_components_numpy(mask)
-    comp, n = nd_label(mask)
+    comp, n = _scipy_label(mask)
     return comp.astype(np.int32, copy=False), int(n)
 
 
@@ -1178,12 +1191,10 @@ def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
                    sigma = smoother (and rounds off / drops fine detail).
     """
     if sigma > 0:
-        try:
-            from scipy.ndimage import gaussian_filter
-        except ImportError:
+        if _scipy_gaussian_filter is None:
             blur = _smooth_mask_3d(sub, iterations=max(1, int(round(2 * sigma))))
         else:
-            blur = gaussian_filter(sub.astype(np.float32), sigma=sigma)
+            blur = _scipy_gaussian_filter(sub.astype(np.float32), sigma=sigma)
         signed = np.clip((blur - 0.5) * 200.0, -120, 120)     # +inside, −outside, 0 at surface
         return signed.astype(np.int8).view(np.uint8)
     return np.where(sub, 100, 200).astype(np.uint8)          # blocky, voxel fidelity
