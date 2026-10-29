@@ -60,11 +60,15 @@ from __future__ import annotations
 
 import datetime
 import os
+import queue
 import struct
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 import numpy as np
 
@@ -124,15 +128,18 @@ _PREP_MARGIN_VOXELS = 4
 # calls will be slow.  Log-only, not a dialog.
 _COMPONENT_WARN_THRESHOLD = 200
 
-# Flat ETA pad (seconds) for meshing time before any AddSurface call has been measured
-# this run.  Once one completes, the measured mean per mesh is projected instead — the
-# pad only covers the window where there is nothing to project from.
-_ETA_MESH_PAD_S = 60.0
+# Padding on the finish-time estimate, as a fraction of the projected remaining time.
+# It is applied in full at the start of the build and shrinks to zero as the build
+# completes, so early estimates lean late and settle as more surfaces finish.
+_ETA_PESSIMISM = 0.5
 
 # Open log file handle (set by _setup_logging); every _log() line carries a timestamp
 # so it is clear which step consumes time.  None until setup, in which case _log()
 # still prints to the console.
 _LOG_FH = None
+
+# Messages passed to _warn during the current run, shown again on the summary page.
+_RUN_WARNINGS: list[str] = []
 
 
 class _SykLockedError(RuntimeError):
@@ -156,6 +163,8 @@ def _setup_logging():
     i.e. <script_dir>/logs/import_from_syglass_xt_<timestamp>.log.  Returns the path, or None on failure.
     """
     global _LOG_FH
+    _RUN_WARNINGS.clear()
+    sys.stderr = _StderrToLog(sys.__stderr__)
     if _LOG_FH is not None:            # a previous run in this Imaris session left one open
         try:
             _LOG_FH.close()
@@ -188,8 +197,44 @@ def _log(msg: str) -> None:
 
 
 def _warn(msg: str) -> None:
-    """Log a line that the user should notice when reading back the log."""
+    """Log a line the user should notice, and keep it for the summary page."""
+    _RUN_WARNINGS.append(msg)
     _log(f"WARNING: {msg}")
+
+
+class _StderrToLog:
+    """
+    Stand-in for sys.stderr that writes to the console and copies the text to the log.
+    Libraries print warnings and tracebacks to stderr, and with the console minimized
+    they would otherwise be easy to miss.
+    """
+
+    def __init__(self, console) -> None:
+        self.console = console
+
+    def write(self, text: str) -> int:
+        self.console.write(text)
+        if _LOG_FH is not None:
+            _LOG_FH.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.console.flush()
+
+    def __getattr__(self, name):
+        # Anything else (encoding, isatty, fileno) comes from the real console stream.
+        return getattr(self.console, name)
+
+
+def _minimize_console() -> None:
+    """Minimize the console window of the XTension's Python process (Windows only)."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    console_window = ctypes.windll.kernel32.GetConsoleWindow()
+    if console_window:
+        show_minimized = 6    # SW_MINIMIZE
+        ctypes.windll.user32.ShowWindow(console_window, show_minimized)
 
 
 # -----------------------------------------------------------------------
@@ -231,6 +276,7 @@ def _run(imarisFile: int) -> None:
     log_path = _setup_logging()
     if log_path:
         _log(f"logging to: {log_path}")
+    _minimize_console()
 
     vLib = ImarisLib.ImarisLib()
     vApp = vLib.GetApplication(imarisFile)
@@ -257,17 +303,36 @@ def _run(imarisFile: int) -> None:
     _log(f"using .syk: {syk_path}")
 
     # Fail fast on a locked .syk — before the options dialog, not after minutes of work.
-    if not _ensure_syk_readable(syk_path):
+    if not _ensure_syk_readable(syk_path, _ask_retry_dialog):
         _log("import aborted — .syk locked by syGlass.")
         return
 
-    settings = _ask_settings()
+    # From here on, everything the user sees happens in one window: options, progress,
+    # then a summary that stays open until closed.  A failure also ends on the summary.
+    window = _Window()
+    try:
+        _import(vApp, syk_path, ims_stem, window, log_path)
+    except Exception as exc:
+        _log(traceback.format_exc())
+        window.show_summary(_Summary(
+            succeeded=False,
+            headline="The import failed.",
+            details=[f"{type(exc).__name__}: {exc}"],
+            warnings=list(_RUN_WARNINGS),
+            log_path=log_path))
+        raise
+
+
+def _import(vApp, syk_path: str, ims_stem: str, window: _Window, log_path: str | None) -> None:
+    """Options, mask read and surface build, reported through `window`."""
+    settings = window.ask_options()
     if settings is None:
         _log("options menu cancelled — nothing imported.")
+        window.close()
         return
-    _log(f"options: smoothing sigma={settings['sigma']}  "
-         f"diagnostics={settings['diagnostics']}  "
-         f"block trim={settings['trim']}")
+    _log(f"options: smoothing sigma={settings.sigma}  "
+         f"diagnostics={settings.diagnostics}  "
+         f"block trim={settings.trim}")
     if _SCIPY_IMPORT_ERROR is not None:
         _warn(f"scipy could not be imported ({_SCIPY_IMPORT_ERROR}); using the NumPy "
               f"fallbacks. Component labeling is slower, and smoothing approximates the "
@@ -283,15 +348,28 @@ def _run(imarisFile: int) -> None:
         _warn(f".ims has {geom.size_t} timepoints; surfaces are built from a single volume "
               f"and will land on t=0 only.")
 
+    def stop(message: str) -> None:
+        """End the import early, showing why on the summary page."""
+        _log(f"import stopped: {message}")
+        window.show_summary(_Summary(
+            succeeded=False,
+            headline="Nothing was imported.",
+            details=[message],
+            warnings=list(_RUN_WARNINGS),
+            log_path=log_path))
+
     # ----------------------------------------------------------------
     # 3. Read syGlass label mask
     # ----------------------------------------------------------------
-    # Progress window is created here (before the multi-second read) so the user sees each
-    # phase; it is closed in the finally at the end of the surface loop.
-    prog = _Progress("syGlass → Imaris — importing mask")
+    status = _ImportStatus()
+    window.show_progress(status)
 
-    prog.phase("Reading syGlass mask from .syk")
+    status.begin_stage("read")
     t_read0 = time.time()
+
+    def block_read(done: int, total: int) -> None:
+        status.set_activity(f"Reading mask blocks ({done} of {total})", done, total)
+
     # label_vol: (NX, NY, NZ) uint16, 0=background, 1..N=label.
     # clip_info: (vx0, vy0, vz0, full_nx, full_ny, full_nz) — the sub-region that was read.
     # syGlass can re-acquire the lock between the pre-flight check and here, so the read
@@ -299,24 +377,24 @@ def _run(imarisFile: int) -> None:
     while True:
         try:
             label_vol, clip_info = _read_mask_from_syk(syk_path,
-                                                       diagnostics=settings["diagnostics"],
-                                                       trim=settings["trim"])
+                                                       diagnostics=settings.diagnostics,
+                                                       trim=settings.trim,
+                                                       on_block=block_read)
             break
         except _SykLockedError:
-            if not _ensure_syk_readable(syk_path):
-                prog.close()
-                _warn_dialog(f"The .syk is locked by syGlass. {_LOCKED_SYK_HINT} "
-                             f"Then re-run the import.")
+            if not _ensure_syk_readable(syk_path, window.ask_retry):
+                stop(f"The .syk is locked by syGlass. {_LOCKED_SYK_HINT} "
+                     f"Then run the import again.")
                 return
 
     if label_vol is None or not np.any(label_vol):
-        prog.close()
-        _warn_dialog("No mask data found in .syk (file empty or unparseable) — "
-                     "see the log for details.")
+        stop("No mask data was found in the .syk. The file is empty or could not be "
+             "read; the log has details.")
         return
     _log(f"mask read in {time.time() - t_read0:.1f}s")
 
-    prog.phase("Inventorying labels")
+    status.begin_stage("labels")
+    status.set_activity("Counting voxels per label")
     t_scan0 = time.time()
     label_ids, counts = _inventory_labels(label_vol)
     _log(f"label_vol shape: {label_vol.shape}, dtype: {label_vol.dtype}")
@@ -326,15 +404,14 @@ def _run(imarisFile: int) -> None:
         _log(f"  label {v}: {int(counts[v])} voxels")
     _log(f"Found {len(label_ids)} labels: {label_ids}")
     if not label_ids:
-        prog.close()
-        _warn_dialog("The .syk contains voxel data but no usable label IDs — nothing to mesh.")
+        stop("The .syk contains voxel data but no usable label IDs, so there is nothing "
+             "to mesh.")
         return
-    prog.start_labels(len(label_ids))
 
     # Troubleshooting only: ASCII max-projections of the reconstructed mask (shape sanity
     # check, independent of Imaris).
-    if settings["diagnostics"]:
-        prog.phase("Rendering mask preview")
+    if settings.diagnostics:
+        status.set_activity("Rendering mask preview for the log")
         _log_mask_projections(label_vol)
 
     # ----------------------------------------------------------------
@@ -342,11 +419,11 @@ def _run(imarisFile: int) -> None:
     # ----------------------------------------------------------------
     factory = vApp.GetFactory()
     scene   = vApp.GetSurpassScene()
-    try:
-        _build_surfaces(factory, scene, label_vol, label_ids, geom, clip_info,
-                        settings["sigma"], prog, ims_stem)
-    finally:
-        prog.close()
+    status.begin_stage("build")
+    result = _build_surfaces(factory, scene, label_vol, label_ids,
+                             [int(counts[label_id]) for label_id in label_ids],
+                             geom, clip_info, settings.sigma, status, ims_stem)
+    status.begin_stage("done")
 
     # ----------------------------------------------------------------
     # 5. Done — not saving on purpose.
@@ -356,6 +433,21 @@ def _run(imarisFile: int) -> None:
     # ----------------------------------------------------------------
     _log("Done — surfaces added to the scene. Press Ctrl+S "
          "in Imaris to write them to the .ims when ready.")
+
+    details = [f"Created {result.n_items} surface item(s) holding {result.n_objects} "
+               f"object(s) in {_format_duration(time.time() - t_read0)}.",
+               "The surfaces are in the scene but not saved. Press Ctrl+S in Imaris to "
+               "write them to the .ims."]
+    if result.n_vanished:
+        details.append(f"{result.n_vanished} small piece(s) ({result.vanished_voxels} "
+                       f"voxels) disappeared under the smoothing and were skipped. "
+                       f"Lower the smoothing to keep them.")
+    window.show_summary(_Summary(
+        succeeded=True,
+        headline="Import finished.",
+        details=details,
+        warnings=list(_RUN_WARNINGS),
+        log_path=log_path))
 
 
 # -----------------------------------------------------------------------
@@ -478,11 +570,22 @@ def _resolve_uint8_type():
     return 0
 
 
-def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_info,
-                    sigma: float, prog, name_prefix: str) -> None:
+@dataclass
+class _BuildResult:
+    """What _build_surfaces created, for the summary page."""
+    n_items: int
+    n_objects: int
+    n_vanished: int
+    vanished_voxels: int
+
+
+def _build_surfaces(factory, scene, label_vol, label_ids, label_voxels: list[int],
+                    geom: _Geometry, clip_info, sigma: float, status: _ImportStatus,
+                    name_prefix: str) -> _BuildResult:
     """
     Create one ISurfaces item per label — holding one surface object per disconnected
-    component — and add it to the Surpass scene.
+    component — and add it to the Surpass scene.  `label_voxels` holds each label's voxel
+    count, in the order of `label_ids`, for the finish-time estimate in `status`.
 
     AddSurface interprets the dataset as a signed field and finds the surface at the zero
     crossing (uint8 treated as signed int8: 100 → +100 inside, 200 → −56 outside), and
@@ -531,22 +634,46 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
     t_run0 = time.time()
     sum_prep = sum_upload = sum_detect = 0.0
     n_items = n_objects = 0
+    n_vanished = vanished_voxels = 0
+
+    status.n_labels = n_labels
+    status.label_voxels = list(label_voxels)
+
+    def label_prefix(label_idx: int) -> str:
+        if n_labels == 1:
+            return ""
+        return f"Label {label_idx + 1} of {n_labels}: "
+
+    def prep_reporter(label_idx: int):
+        """
+        Progress callback for one label's prep.  Prep runs one label ahead, so its
+        updates only reach the window while the build loop is waiting for that label.
+        """
+        def report(text: str, done: int, total: int) -> None:
+            if status.waiting_for_prep and status.label_index == label_idx:
+                status.set_activity(label_prefix(label_idx) + text, done, total)
+        return report
 
     # One worker is enough: the loop only submits the next prep after collecting the
     # current one, so at most one prep is ever in flight.
     with ThreadPoolExecutor(max_workers=1) as pool:
-        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma)
+        next_future = pool.submit(_prep_label, label_vol, label_ids[0], sigma,
+                                  on_progress=prep_reporter(0))
         for label_idx, label_id in enumerate(label_ids):
             tag = f"L{label_idx + 1}/{n_labels} (id {label_id})"
 
-            prog.preparing(label_idx)      # caption shown during the (blocking) prep wait
+            status.begin_label(label_idx)
+            status.waiting_for_prep = True
+            status.set_activity(label_prefix(label_idx) + "Preparing surfaces")
             t0 = time.time()
             prep = next_future.result()
             t_prep = time.time() - t0
+            status.waiting_for_prep = False
             # Kick off prep for the next label so it overlaps this label's upload.
             if label_idx + 1 < n_labels:
                 next_future = pool.submit(_prep_label, label_vol,
-                                          label_ids[label_idx + 1], sigma)
+                                          label_ids[label_idx + 1], sigma,
+                                          on_progress=prep_reporter(label_idx + 1))
 
             if prep is None or not prep["components"]:
                 if prep is None:
@@ -554,8 +681,8 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                 else:
                     _log(f"{tag}: all {prep['n_components']} component(s) vanished "
                          f"under the blur — skipped")
-                prog.begin_label(label_idx, 1)
-                prog.end_label(0.0)
+                    n_vanished += prep["n_vanished"]
+                    vanished_voxels += prep["vanished_voxels"]
                 continue
 
             comps = prep["components"]
@@ -566,18 +693,21 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                 _log(f"{tag}: {prep['n_vanished']} component(s) vanished under the blur "
                      f"({prep['vanished_voxels']} vox) — too small for sigma={sigma}; "
                      f"lower the smoothing to keep them")
+                n_vanished += prep["n_vanished"]
+                vanished_voxels += prep["vanished_voxels"]
             if n_comps > _COMPONENT_WARN_THRESHOLD:
                 _warn(f"{tag}: {n_comps} disconnected components — one AddSurface call "
                       f"each will be slow; debris can be deleted afterwards in Imaris "
                       f"(Filter tab, e.g. \"Number of Voxels\")")
 
-            prog.begin_label(label_idx,
-                             sum(_upload_ticks(*f.shape) for f, _o, _v, _k in comps),
-                             n_comps)
+            status.pieces_in_label = n_comps
             surfaces = factory.CreateSurfaces()
 
             t_up = t_det = 0.0
             for ci, (field, offset, comp_voxels, n_kept) in enumerate(comps):
+                status.set_activity(label_prefix(label_idx) +
+                                    f"Building surface {ci + 1} of {n_comps} in Imaris",
+                                    ci, n_comps)
                 crop = np.array(field.shape)
                 # Physical extents of this component's crop (sub-region of the clip volume).
                 lo, hi = _field_extents(ds_lo, per_voxel, offset, crop)
@@ -593,16 +723,14 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
                 sdf_ds.SetExtendMaxX(hi[0]); sdf_ds.SetExtendMaxY(hi[1]); sdf_ds.SetExtendMaxZ(hi[2])
 
                 t0 = time.time()
-                _upload_field(sdf_ds, field, prog)
+                _upload_field(sdf_ds, field)
                 t_up += time.time() - t0
 
                 # One AddSurface per component = one surface object per component.
-                prog.detecting(ci, n_comps)
                 t0 = time.time()
                 surfaces.AddSurface(sdf_ds, 0)
-                dt_mesh = time.time() - t0
-                t_det += dt_mesh
-                prog.meshed(dt_mesh)
+                t_det += time.time() - t0
+                status.piece_built(comp_voxels)
             del comps, prep   # free this label's fields before the next prep is awaited
 
             try:
@@ -620,13 +748,14 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
             sum_prep += t_prep; sum_upload += t_up; sum_detect += t_det
             _log(f"{tag}: prep_wait={t_prep:.2f}s  upload={t_up:.2f}s  "
                  f"detect={t_det:.2f}s  surfaces_in_object={n_surf}")
-            prog.end_label(t_prep + t_up + t_det)
 
     t_total = time.time() - t_run0
     _log(f"Created {n_items} surface item(s) holding {n_objects} object(s) "
          f"in {t_total:.1f}s  "
          f"(prep_wait {sum_prep:.1f}s + upload {sum_upload:.1f}s + detect {sum_detect:.1f}s; "
          f"avg {t_total / max(1, n_labels):.2f}s/label)")
+    return _BuildResult(n_items=n_items, n_objects=n_objects,
+                        n_vanished=n_vanished, vanished_voxels=vanished_voxels)
 
 
 # -----------------------------------------------------------------------
@@ -634,15 +763,19 @@ def _build_surfaces(factory, scene, label_vol, label_ids, geom: _Geometry, clip_
 # -----------------------------------------------------------------------
 
 def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
-                        trim=_DEFAULT_TRIM):
+                        trim=_DEFAULT_TRIM, on_block=None):
     """
     Read the syGlass label mask from a .syk file.
 
     Scans all block headers to inventory the octree, reads the root block to
     estimate the mask bounding box, then composites, within that bbox, every
     region that has no stored finer block: childless blocks whole, and the
-    child-less octants of partly subdivided ones (coarse data is upsampled).  Reading only the bbox avoids allocating the full (potentially
-    huge) reconstructed volume.
+    child-less octants of partly subdivided ones (coarse data is upsampled).
+    Reading only the bbox avoids allocating the full (potentially huge)
+    reconstructed volume.
+
+    `on_block(done, total)`, if given, is called as blocks are visited.  Each block in
+    the bbox is visited twice, once to check it for mask and once to place it.
 
     Returns ((NX, NY, NZ) uint16 array, clip_info) where
       clip_info = (vx0, vy0, vz0, full_nx, full_ny, full_nz)
@@ -752,8 +885,17 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
         def has_mask(a):
             return bool(((a > 0) & (a <= _MAX_PLAUSIBLE_LABEL)).any())
 
+        blocks_to_visit = 2 * len(geom)
+        blocks_visited = 0
+
         with open(syk_path, "rb") as f:
-            empty = {bid for bid in geom if not has_mask(read_block(f, block_offset[bid]))}
+            empty = set()
+            for bid in geom:
+                if not has_mask(read_block(f, block_offset[bid])):
+                    empty.add(bid)
+                blocks_visited += 1
+                if on_block is not None:
+                    on_block(blocks_visited, blocks_to_visit)
 
             # An empty block is a placeholder only if its nearest non-empty ancestor has
             # mask in the voxels that lie wholly inside the block's region.  The trimmed
@@ -790,6 +932,9 @@ def _read_mask_from_syk(syk_path: str, diagnostics: bool = False,
             n_sentinel = 0
             per_level = {}
             for bid in sorted(geom, key=lambda b: geom[b][0]):
+                blocks_visited += 1
+                if on_block is not None:
+                    on_block(blocks_visited, blocks_to_visit)
                 if bid in placeholder:
                     continue                      # its ancestor holds the data
                 stored = children.get(bid, set())
@@ -1200,7 +1345,8 @@ def _signed_field(sub: np.ndarray, sigma: float) -> np.ndarray:
     return np.where(sub, 100, 200).astype(np.uint8)          # blocky, voxel fidelity
 
 
-def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
+def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS,
+                on_progress=None):
     """
     Build the signed uint8 fields AddSurface meshes for one label — one field per
     disconnected component, each cropped to its own bounding box (CPU-only, thread-safe —
@@ -1221,6 +1367,8 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
                       than sent through a pointless AddSurface call
       n_painted:      voxels of this label in label_vol
     `margin` grows with sigma so the blur has room to fall back to "outside" in-crop.
+    `on_progress(text, done, total)`, if given, is called as the work advances; a total
+    of 0 means the step has no count.
     """
     m = max(margin, int(np.ceil(3 * sigma)) + 1)   # room for the Gaussian tail
     bbox = _label_bbox(label_vol, label_id, m)
@@ -1231,6 +1379,8 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
     sub = label_vol[lx:x1, ly:y1, lz:z1] == label_id   # crop-sized boolean only
     n_painted = int(sub.sum())
 
+    if on_progress is not None:
+        on_progress("Finding separate pieces", 0, 0)
     comps, n_comps = _label_components(sub)
     del sub
     sizes = np.bincount(comps.ravel())       # sizes[0] = background, ignored
@@ -1238,7 +1388,10 @@ def _prep_label(label_vol, label_id, sigma=0.0, margin=_PREP_MARGIN_VOXELS):
 
     components = []
     n_vanished = vanished_voxels = 0
-    for cid in keep:
+    for piece_index, cid in enumerate(keep):
+        if on_progress is not None:
+            on_progress(f"Preparing piece {piece_index + 1} of {n_comps}",
+                        piece_index, n_comps)
         cmask = comps == cid                 # isolation: neighbours excluded before blur
         (ox, oy, oz), (cx1, cy1, cz1) = _mask_bbox(cmask, m)
         field = _signed_field(cmask[ox:cx1, oy:cy1, oz:cz1], sigma)
@@ -1286,11 +1439,10 @@ def _smooth_mask_3d(mask, iterations=3):
 
 def _upload_bands(nx: int, ny: int, nz: int, budget: int | None = None):
     """
-    Split an (nx, ny, nz) uint8 field into upload bands — the single source of truth for
-    both the COM call pattern and the progress-bar tick count.
+    Split an (nx, ny, nz) uint8 field into upload bands for _upload_field.
 
     Returns a list of (z0, z1, y_strips); each (z-range, y-strip) pair is one COM call and
-    stays under `budget` bytes, and each band is one progress tick.  Whole z-bands are used
+    stays under `budget` bytes.  Whole z-bands are used
     when a full XY slice fits in the budget; otherwise one z-slice per band, tiled in Y.
 
     `budget` defaults to _ICE_CHUNK_BYTES read at call time, not import time, so the
@@ -1312,18 +1464,13 @@ def _upload_bands(nx: int, ny: int, nz: int, budget: int | None = None):
     return [(z, z + 1, strips) for z in range(nz)]
 
 
-def _upload_ticks(nx: int, ny: int, nz: int, budget: int | None = None) -> int:
-    """Number of progress ticks _upload_field will emit for an (nx,ny,nz) uint8 field."""
-    return len(_upload_bands(int(nx), int(ny), int(nz), budget))
-
-
-def _upload_field(ds, field: np.ndarray, prog, budget: int | None = None) -> int:
+def _upload_field(ds, field: np.ndarray, budget: int | None = None) -> int:
     """
     Upload a cropped (nx,ny,nz) uint8 field to an IDataSet via SetDataSubVolumeAs1DArrayBytes.
 
     Imaris' 1D layout is X-fastest, then Y, then Z.  field is (X,Y,Z), so transposing a
     sub-block to (Z,Y,X) and calling the default C-order .tobytes() yields x-fastest bytes.
-    Ticks `prog` once per band.  Returns the number of COM calls made.
+    Returns the number of COM calls made.
     """
     nx, ny, nz = field.shape
     calls = 0
@@ -1332,7 +1479,6 @@ def _upload_field(ds, field: np.ndarray, prog, budget: int | None = None) -> int
             blob = field[:, y0:y1, z0:z1].transpose(2, 1, 0).tobytes()
             ds.SetDataSubVolumeAs1DArrayBytes(blob, 0, y0, z0, 0, 0, nx, y1 - y0, z1 - z0)
             calls += 1
-        prog.band()
     return calls
 
 
@@ -1411,33 +1557,35 @@ def _syk_is_locked(path: str) -> bool:
         return True
 
 
-def _ensure_syk_readable(path: str) -> bool:
+def _ensure_syk_readable(path: str, ask_retry) -> bool:
     """
     Block until the .syk is readable or the user gives up.  Returns True when readable.
 
-    While the file is locked, shows a Retry/Cancel dialog so the user can close the
-    project in syGlass without restarting the XTension.  The wording covers both lock
-    states seen in the wild: syGlass sometimes keeps the .syk handle open after the
-    project itself is closed, in which case only exiting syGlass releases it.
+    While the file is locked, `ask_retry(message)` shows a Retry/Cancel prompt and
+    returns True for Retry, so the user can close the project in syGlass without
+    restarting the XTension.  The wording covers both lock states seen in the wild:
+    syGlass sometimes keeps the .syk handle open after the project itself is closed, in
+    which case only exiting syGlass releases it.
     """
     msg = (f"The .syk file is locked by syGlass:\n\n{path}\n\n"
            f"{_LOCKED_SYK_HINT}\n\nThen press Retry.")
     while _syk_is_locked(path):
-        _warn(f".syk locked by syGlass: {path}")
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            retry = messagebox.askretrycancel("Import from syGlass", msg, parent=root)
-            root.destroy()
-        except Exception as exc:
-            _log(f"retry dialog unavailable ({exc}); giving up on the locked .syk. {msg}")
-            return False
-        if not retry:
+        _log(f".syk locked by syGlass: {path}")
+        if not ask_retry(msg):
             return False
     return True
+
+
+def _ask_retry_dialog(message: str) -> bool:
+    """Standalone Retry/Cancel dialog, for use before the import window exists."""
+    import tkinter as tk
+    from tkinter import messagebox
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    retry = messagebox.askretrycancel("Import from syGlass", message, parent=root)
+    root.destroy()
+    return retry
 
 
 def _ask_for_syk(initialdir: str) -> str | None:
@@ -1484,36 +1632,278 @@ _SMOOTHING_LEVELS = [
 _DEFAULT_SIGMA = 1.0
 
 
-def _ask_settings() -> dict | None:
-    """
-    Show an options menu (tkinter) and return {'sigma': float, 'diagnostics': bool,
-    'trim': (int, int, int)}, or None if the user cancelled.
+@dataclass
+class _Settings:
+    """Choices made on the options page."""
+    sigma: float
+    diagnostics: bool
+    trim: tuple[int, int, int]
 
-    Lets the user pick a surface-smoothing preset or type a custom blur, and toggle
-    troubleshooting (block diagnostics + mask preview in the log).  The dialog always
-    opens with the same defaults rather than remembering the last run — same reasoning
-    as _ask_for_syk: in a core setting, best not to carry over the previous user's
-    settings, especially a hand-edited block trim.
+
+# -----------------------------------------------------------------------
+# Progress reporting
+# -----------------------------------------------------------------------
+
+@dataclass
+class _ImportStatus:
     """
-    defaults = {"sigma": _DEFAULT_SIGMA,
-                "diagnostics": False,
-                "trim": _DEFAULT_TRIM}
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-        root = tk.Tk()
-        root.title("syGlass → Imaris — options")
-        root.attributes("-topmost", True)
+    Progress of the import, written by the import and prep threads and read by the
+    window thread, which redraws from it several times a second.  Fields are set one
+    at a time without a lock, so a redraw can catch an update halfway; the next redraw
+    shows it complete.
+    """
+    stage: str = ""                  # "read", "labels", "build" or "done"
+    stage_start: float = 0.0
+    stage_durations: dict = dataclass_field(default_factory=dict)
+
+    # The line under the stage list and the bar beneath it.  A total of 0 means the
+    # current step has no count, and the bar animates instead.
+    activity: str = "Starting"
+    activity_done: int = 0
+    activity_total: int = 0
+
+    # Inputs to the finish-time estimate, set during the build stage.
+    n_labels: int = 0
+    label_voxels: list = dataclass_field(default_factory=list)
+    label_index: int = 0
+    waiting_for_prep: bool = False
+    pieces_in_label: int = 0
+    pieces_built: int = 0
+    voxels_built_in_label: int = 0
+
+    def begin_stage(self, stage: str) -> None:
+        now = time.time()
+        if self.stage:
+            self.stage_durations[self.stage] = now - self.stage_start
+        self.stage = stage
+        self.stage_start = now
+
+    def set_activity(self, text: str, done: int = 0, total: int = 0) -> None:
+        self.activity_done = done
+        self.activity_total = total
+        self.activity = text
+
+    def begin_label(self, label_index: int) -> None:
+        self.pieces_in_label = 0
+        self.pieces_built = 0
+        self.voxels_built_in_label = 0
+        self.label_index = label_index
+
+    def piece_built(self, voxels: int) -> None:
+        self.pieces_built += 1
+        self.voxels_built_in_label += voxels
+
+    def build_fractions(self) -> tuple[float, float]:
+        """Share of the build that is done, measured by voxels and by pieces."""
+        total_voxels = sum(self.label_voxels)
+        finished_voxels = sum(self.label_voxels[:self.label_index])
+        voxel_fraction = (finished_voxels + self.voxels_built_in_label) / total_voxels
+        if self.pieces_in_label > 0:
+            label_part = self.pieces_built / self.pieces_in_label
+        else:
+            label_part = 0.0
+        piece_fraction = (self.label_index + label_part) / self.n_labels
+        return voxel_fraction, piece_fraction
+
+
+def _estimate_remaining(elapsed: float, voxel_fraction: float,
+                        piece_fraction: float) -> float | None:
+    """
+    Seconds of build left, projected from the time spent and the share of the build done.
+
+    The share is the smaller of the voxel and piece measures, so whichever is further
+    behind sets the estimate.  The projection is then padded by _ETA_PESSIMISM, scaled
+    down as the build completes.  Returns None until some of the build is done.
+    """
+    fraction = min(voxel_fraction, piece_fraction)
+    if fraction <= 0.0:
+        return None
+    if fraction >= 1.0:
+        return 0.0
+    projected = elapsed / fraction - elapsed
+    return projected * (1.0 + _ETA_PESSIMISM * (1.0 - fraction))
+
+
+def _format_duration(seconds: float) -> str:
+    """Seconds as m:ss, or h:mm:ss from an hour up."""
+    minutes, secs = divmod(int(max(0.0, seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+@dataclass
+class _Summary:
+    """Contents of the summary page shown when the import ends."""
+    succeeded: bool
+    headline: str
+    details: list[str]
+    warnings: list[str]
+    log_path: str | None
+
+
+class _Window:
+    """
+    The import's one window: the options page, then progress, then a summary that stays
+    open until the user closes it.
+
+    Tk runs in its own thread, so the window keeps redrawing while the import thread is
+    busy in NumPy or waiting on Imaris.  The import thread never calls Tk itself.  It
+    queues functions on `_requests`, which the Tk thread runs, and waits on `_replies`
+    for the user's answers.
+    """
+
+    _TITLE = "Import from syGlass"
+    _WIDTH = 560
+    _POLL_MS = 100
+    _BAR_STEPS = 1000
+    _STAGES = [("read", "Read mask from .syk"),
+               ("labels", "Find labels"),
+               ("build", "Build surfaces in Imaris")]
+
+    def __init__(self) -> None:
+        self._requests = queue.Queue()
+        self._replies = queue.Queue()
+        self._closed = threading.Event()
+        self._startup_error = None
+        started = threading.Event()
+        self._thread = threading.Thread(target=self._run_tk, args=(started,), daemon=True)
+        self._thread.start()
+        started.wait()
+        if self._startup_error is not None:
+            raise RuntimeError("could not open the import window") from self._startup_error
+
+    # ---- Called from the import thread ----------------------------------
+
+    def ask_options(self) -> _Settings | None:
+        """Show the options page and wait for Run (settings) or Cancel (None)."""
+        self._requests.put(self._show_options)
+        return self._wait_for_reply()
+
+    def ask_retry(self, message: str) -> bool:
+        """Show a Retry/Cancel prompt over the window; True for Retry."""
+        self._requests.put(lambda: self._show_retry(message))
+        return self._wait_for_reply()
+
+    def show_progress(self, status: _ImportStatus) -> None:
+        self._requests.put(lambda: self._show_progress(status))
+
+    def show_summary(self, summary: _Summary) -> None:
+        """Show the summary page and wait until the user closes the window."""
+        self._requests.put(lambda: self._show_summary(summary))
+        self._closed.wait()
+
+    def close(self) -> None:
+        self._requests.put(self._root.quit)
+        self._closed.wait()
+
+    def _wait_for_reply(self):
+        reply = self._replies.get()
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    # ---- Tk thread ------------------------------------------------------
+
+    def _run_tk(self, started: threading.Event) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox, ttk
+            self._tk = tk
+            self._ttk = ttk
+            self._messagebox = messagebox
+            self._root = tk.Tk()
+            self._root.title(self._TITLE)
+            self._root.resizable(False, False)
+            self._root.protocol("WM_DELETE_WINDOW", self._on_close_button)
+            self._root.report_callback_exception = self._on_tk_error
+        except Exception as exc:
+            self._startup_error = exc
+            started.set()
+            return
+        self._page = None
+        self._close_action = None
+        self._positioned = False
+        self._status = None
+        self._progress = None
+        started.set()
+        self._root.after(self._POLL_MS, self._poll)
+        self._root.mainloop()
+        self._root.destroy()
+        self._closed.set()
+
+    def _on_tk_error(self, exc_type, exc, tb) -> None:
+        """A bug in the window code: log it, then end the window so nothing waits forever."""
+        _log("import window failed:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+        self._replies.put(RuntimeError("the import window failed; see the log"))
+        self._root.quit()
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                request = self._requests.get_nowait()
+            except queue.Empty:
+                break
+            request()
+        if self._status is not None:
+            self._redraw_progress()
+        self._root.after(self._POLL_MS, self._poll)
+
+    def _on_close_button(self) -> None:
+        # The progress page has no close action, so the window can't be closed mid-import.
+        if self._close_action is not None:
+            self._close_action()
+
+    def _set_page(self, close_action, topmost: bool):
+        """Replace the current page with an empty one and return it for filling."""
+        if self._page is not None:
+            self._page.destroy()
+        self._page = self._tk.Frame(self._root, padx=16, pady=12)
+        self._page.pack(fill="both", expand=True)
+        self._close_action = close_action
+        self._root.attributes("-topmost", topmost)
+        return self._page
+
+    def _fit(self) -> None:
+        """Size the window to its page, centring it on the screen the first time."""
+        self._root.update_idletasks()
+        width = max(self._WIDTH, self._root.winfo_reqwidth())
+        height = self._root.winfo_reqheight()
+        if self._positioned:
+            self._root.geometry(f"{width}x{height}")
+        else:
+            x = (self._root.winfo_screenwidth() - width) // 2
+            y = (self._root.winfo_screenheight() - height) // 3
+            self._root.geometry(f"{width}x{height}+{x}+{y}")
+            self._positioned = True
+        self._root.lift()
+        self._root.focus_force()
+
+    def _show_retry(self, message: str) -> None:
+        retry = self._messagebox.askretrycancel(self._TITLE, message, parent=self._root)
+        self._replies.put(retry)
+
+    # ---- Options page ---------------------------------------------------
+
+    def _show_options(self) -> None:
+        """
+        The options page always opens with the same defaults rather than remembering the
+        last run — same reasoning as _ask_for_syk: in a core setting, best not to carry
+        over the previous user's settings, especially a hand-edited block trim.
+        """
+        tk = self._tk
+        page = self._set_page(close_action=self._cancel_options, topmost=True)
 
         # Two tabs.  Everything a normal import needs is on the first; the second holds
         # settings that are either diagnostic or not trustworthy yet, kept out of the
         # way so people aren't tempted to change something usually best left alone.
-        tabs = ttk.Notebook(root)
+        tabs = self._ttk.Notebook(page)
         basic = tk.Frame(tabs)
         advanced = tk.Frame(tabs)
         tabs.add(basic, text="  Import  ")
         tabs.add(advanced, text="  Advanced  ")
-        tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        tabs.pack(fill="both", expand=True)
 
         # ---- Import tab: surface smoothing only ----------------------------
         tk.Label(basic, text="Surface smoothing", font=("", 10, "bold"),
@@ -1522,13 +1912,13 @@ def _ask_settings() -> dict | None:
                             "less voxel detail.",
                  anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
                                                                   pady=(0, 6))
-        sigma_var = tk.DoubleVar(value=defaults["sigma"])
+        sigma_var = tk.DoubleVar(value=_DEFAULT_SIGMA)
 
         crow = tk.Frame(basic)
         custom = tk.Entry(crow, width=8)
 
-        def _clear_custom():
-            """A preset click wins over a stale custom value (see _ok)."""
+        def clear_custom():
+            """A preset click wins over a stale custom value (see run)."""
             custom.delete(0, "end")
 
         # Presets show their blur value, so a user who wants something in between can
@@ -1536,7 +1926,7 @@ def _ask_settings() -> dict | None:
         for name, val in _SMOOTHING_LEVELS:
             text = name if val <= 0 else f"{name} (blur {val:g})"
             tk.Radiobutton(basic, text=text, variable=sigma_var, value=val, anchor="w",
-                           command=_clear_custom).pack(fill="x", padx=26)
+                           command=clear_custom).pack(fill="x", padx=26)
 
         crow.pack(fill="x", padx=26, pady=(4, 12))
         tk.Label(crow, text="…or custom blur:").pack(side="left")
@@ -1552,7 +1942,7 @@ def _ask_settings() -> dict | None:
                      fill="x", padx=14, pady=(0, 12))
 
         # ---- Advanced tab: diagnostics, block geometry ---------------------
-        diag_var = tk.BooleanVar(value=defaults["diagnostics"])
+        diag_var = tk.BooleanVar(value=False)
         tk.Checkbutton(advanced, text="Troubleshooting: log block diagnostics + mask preview",
                        variable=diag_var, anchor="w").pack(fill="x", padx=14, pady=(12, 10))
 
@@ -1564,275 +1954,165 @@ def _ask_settings() -> dict | None:
                       "block boundaries.",
                  anchor="w", justify="left", wraplength=430).pack(fill="x", padx=14,
                                                                   pady=(0, 6))
-        trow = tk.Frame(advanced); trow.pack(fill="x", padx=26, pady=(0, 12))
+        trow = tk.Frame(advanced)
+        trow.pack(fill="x", padx=26, pady=(0, 12))
         trim_entry = tk.Entry(trow, width=12)
-        trim_entry.insert(0, ",".join(str(v) for v in defaults["trim"]))
+        trim_entry.insert(0, ",".join(str(v) for v in _DEFAULT_TRIM))
         trim_entry.pack(side="left")
         tk.Label(trow, text=f"  (default {','.join(str(v) for v in _DEFAULT_TRIM)})",
                  fg="grey").pack(side="left")
 
-        out = {}
-        state = {"cancelled": False}
-
-        def _ok():
-            # Invalid input pops an error and leaves the dialog open for correction —
-            # silently reverting to a default would let the user believe they tested a
-            # value they did not test.
-            from tkinter import messagebox
-
-            def _bad(text):
-                messagebox.showerror("Import from syGlass", text, parent=root)
-
-            s_val = float(sigma_var.get())
-            c = custom.get().strip()
-            if c:
+        def run():
+            # Invalid input shows an error and leaves the page open for correction.
+            # Reverting to a default would let the user believe they tested a value
+            # they did not test.
+            sigma = float(sigma_var.get())
+            custom_text = custom.get().strip()
+            if custom_text:
                 try:
-                    s_val = float(c)
+                    sigma = float(custom_text)
                 except ValueError:
-                    _bad(f"Custom blur must be a number (got {c!r}).")
+                    self._messagebox.showerror(
+                        self._TITLE, f"Custom blur must be a number (got {custom_text!r}).",
+                        parent=self._root)
                     return
             try:
-                parts = [int(v) for v in trim_entry.get().replace(" ", "").split(",")]
-                if len(parts) != 3:
+                trim = tuple(int(v) for v in trim_entry.get().replace(" ", "").split(","))
+                if len(trim) != 3:
                     raise ValueError
             except ValueError:
-                _bad("Block trim must be three integers separated by commas, e.g. 3,1,1.")
+                self._messagebox.showerror(
+                    self._TITLE,
+                    "Block trim must be three integers separated by commas, e.g. 3,1,1.",
+                    parent=self._root)
                 return
-            out["sigma"] = max(0.0, s_val)
-            out["diagnostics"] = bool(diag_var.get())
-            out["trim"] = tuple(parts)
-            root.quit()
+            self._replies.put(_Settings(sigma=max(0.0, sigma),
+                                        diagnostics=bool(diag_var.get()),
+                                        trim=trim))
+            # Switch pages at once so Run can't be pressed twice; the import thread
+            # hands over its status object shortly after.
+            self._show_progress(None)
 
-        def _cancel():
-            state["cancelled"] = True
-            root.quit()
+        buttons = tk.Frame(page)
+        buttons.pack(pady=(12, 0))
+        tk.Button(buttons, text="Run", width=12, command=run).pack(side="left", padx=6)
+        tk.Button(buttons, text="Cancel", width=12,
+                  command=self._cancel_options).pack(side="left", padx=6)
+        self._fit()
 
-        brow = tk.Frame(root); brow.pack(pady=(0, 12))
-        tk.Button(brow, text="Run", width=12, command=_ok).pack(side="left", padx=6)
-        tk.Button(brow, text="Cancel", width=12, command=_cancel).pack(side="left", padx=6)
-        root.protocol("WM_DELETE_WINDOW", _cancel)
-        root.mainloop()
-        root.destroy()
+    def _cancel_options(self) -> None:
+        self._close_action = None
+        self._replies.put(None)
 
-        if state["cancelled"]:
-            return None
+    # ---- Progress page --------------------------------------------------
 
-        # mainloop only exits via _ok or _cancel, so out is fully populated here.
-        return out
-    except Exception:
-        # Meant for headless setups where tkinter can't open a display — but a bug in the
-        # dialog code lands here too, so log the full traceback to tell the two apart.
-        _log(f"options menu unavailable; using defaults {defaults}\n{traceback.format_exc()}")
-        return defaults
+    def _show_progress(self, status: _ImportStatus | None) -> None:
+        """Build the progress page if it isn't showing yet, then redraw from `status`."""
+        if self._progress is None:
+            tk = self._tk
+            page = self._set_page(close_action=None, topmost=False)
+            stage_rows = {}
+            stage_frame = tk.Frame(page)
+            stage_frame.pack(fill="x")
+            for row, (key, name) in enumerate(self._STAGES):
+                name_label = tk.Label(stage_frame, text=name, anchor="w")
+                name_label.grid(row=row, column=0, sticky="w", pady=1)
+                state_label = tk.Label(stage_frame, text="", anchor="e", fg="grey")
+                state_label.grid(row=row, column=1, sticky="e", pady=1)
+                stage_rows[key] = (name_label, state_label)
+            stage_frame.columnconfigure(0, weight=1)
 
+            activity = tk.Label(page, text="Starting", anchor="w", justify="left",
+                                wraplength=self._WIDTH - 40)
+            activity.pack(fill="x", pady=(12, 4))
+            bar = self._ttk.Progressbar(page, length=self._WIDTH - 32, mode="determinate",
+                                        maximum=self._BAR_STEPS)
+            bar.pack(fill="x")
+            timing = tk.Label(page, text="", anchor="w", fg="grey")
+            timing.pack(fill="x", pady=(6, 0))
+            self._progress = {"start": time.time(), "stage_rows": stage_rows,
+                              "activity": activity, "bar": bar, "bar_mode": "determinate",
+                              "timing": timing}
+            self._fit()
+        if status is not None:
+            self._status = status
 
-# -----------------------------------------------------------------------
-# Progress reporting
-# -----------------------------------------------------------------------
-
-class _Progress:
-    """
-    Progress window (tkinter) that shows the current PHASE and an estimated wall-clock
-    finish TIME.
-
-    Two kinds of update:
-      • phase(text) — the fixed one-off stages (reading mask, inventorying labels) that run
-        before any per-label work.  No label count needed; the bar sits at its current value.
-      • the per-label cycle: preparing() → begin_label() →
-        [band()×N (upload) → detecting() → meshed()] per component → end_label().
-
-    ETA is *live*, and accounts for upload and meshing separately — AddSurface time per
-    component is far from proportional to upload bytes, so band ticks alone undershot
-    badly on labels with many surfaces:
-      • upload remaining is projected from band-tick progress over upload-only elapsed
-        time (meshing time is subtracted out);
-      • meshing remaining is the measured mean AddSurface duration (run-wide, via
-        meshed()) times the component-meshes still to run in this label — with a flat
-        _ETA_MESH_PAD_S until the first mesh has been measured;
-      • labels already completed contribute their measured mean for the labels to come.
-
-    The bar is always determinate and fills strictly left→right; it is never switched to
-    indeterminate mode (AddSurface freezes the Python thread, so an animated bar would just
-    stall mid-bounce).  band() ticks repaint the GUI only (throttled) — never logged.
-    """
-
-    _SCALE = 1000   # bar maximum (permille) — decouples the bar from label/tick counts
-
-    def __init__(self, title: str) -> None:
-        self.start = time.time()
-        self.n_labels = None           # unknown until start_labels()
-        self.times: list[float] = []   # durations of completed labels
-        self.mesh_times: list[float] = []  # measured AddSurface durations, run-wide
-        self.cur = 0                   # current label index (0-based)
-        self.cur_tick = 0
-        self.cur_ticks = 1             # upload ticks declared for the current label
-        self.every = 1                 # GUI-repaint throttle for the current label
-        self.label_start = None        # wall time the current label's UPLOAD began
-        self.n_comps_cur = 0           # component meshes declared for the current label
-        self.comps_done = 0            # component meshes completed in the current label
-        self.mesh_elapsed_cur = 0.0    # meshing seconds spent so far in the current label
-        self.mesh_start = None         # wall time the in-flight AddSurface began
-        self.ok = False
-        self.root = None
-        self.bar = None
-        self.caption = None
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-            self.root = tk.Tk()
-            self.root.title(title)
-            self.root.attributes("-topmost", True)
-            self.caption = tk.Label(self.root, text="Starting…", width=76, anchor="w")
-            self.caption.pack(padx=12, pady=(12, 4))
-            self.bar = ttk.Progressbar(self.root, length=480, mode="determinate",
-                                       maximum=self._SCALE)
-            self.bar.pack(padx=12, pady=(0, 12))
-            self.ok = True
-            self.root.update()
-        except Exception as exc:
-            _log(f"progress GUI unavailable ({exc}); using console output.")
-
-    @staticmethod
-    def _fmt(secs: float) -> str:
-        m, s = divmod(int(max(0, secs)), 60)
-        return f"{m}:{s:02d}"
-
-    def _remaining(self, now: float) -> float | None:
-        """
-        Estimated seconds of work left, or None while there is nothing to project from.
-        Pure arithmetic over the recorded state — see the class note for the model.
-        """
-        per_label = (sum(self.times) / len(self.times)) if self.times else None
-        mean_mesh = (sum(self.mesh_times) / len(self.mesh_times)) if self.mesh_times else None
-        in_flight = (now - self.mesh_start) if self.mesh_start is not None else 0.0
-
-        # Meshing left in this label: the in-flight AddSurface plus one full mesh for
-        # every component not yet started.
-        comps_left = max(0, self.n_comps_cur - self.comps_done)
-        if comps_left > 0:
-            if mean_mesh is not None:
-                mesh_remaining = max(0.0, mean_mesh * comps_left - in_flight)
-            else:
-                mesh_remaining = _ETA_MESH_PAD_S     # nothing measured yet: flat pad
-        else:
-            mesh_remaining = 0.0
-
-        # Upload left, projected from band-tick progress over upload-only elapsed time
-        # (meshing seconds are subtracted so a slow mesh doesn't inflate the upload rate).
-        if self.label_start is not None and self.cur_tick > 0:
-            frac = min(1.0, self.cur_tick / self.cur_ticks)
-            up_elapsed = max(0.0, now - self.label_start - self.mesh_elapsed_cur - in_flight)
-            upload_remaining = max(0.0, up_elapsed / frac - up_elapsed) if frac > 0 else 0.0
-            remaining_cur = upload_remaining + mesh_remaining
-        elif per_label is not None:
-            remaining_cur = per_label            # not uploading yet; fall back to the mean
-        else:
-            return None
-        labels_left = (self.n_labels - self.cur - 1) if self.n_labels else 0
-        est_rest = (per_label if per_label is not None else remaining_cur) * max(0, labels_left)
-        return remaining_cur + est_rest
-
-    def _finish(self) -> str:
-        """Estimated wall-clock finish time as a caption fragment."""
+    def _redraw_progress(self) -> None:
+        status = self._status
+        widgets = self._progress
         now = time.time()
-        rem = self._remaining(now)
-        if rem is None:
-            return "estimating…"
-        return "~" + datetime.datetime.fromtimestamp(now + rem).strftime("%H:%M:%S")
 
-    def _value(self) -> int:
-        if not self.n_labels:
-            return 0
-        intra = min(self.cur_tick / self.cur_ticks, 1.0)
-        frac = min(1.0, (self.cur + intra) / self.n_labels)
-        return int(frac * self._SCALE)
+        for key, (name_label, state_label) in widgets["stage_rows"].items():
+            if key in status.stage_durations:
+                name_label.config(font=("", 9))
+                state_label.config(text=f"done in {_format_duration(status.stage_durations[key])}")
+            elif key == status.stage:
+                name_label.config(font=("", 9, "bold"))
+                state_label.config(text=_format_duration(now - status.stage_start))
+            else:
+                name_label.config(font=("", 9))
+                state_label.config(text="")
 
-    def _refresh(self, caption: str) -> None:
-        if not self.ok:
-            return
-        try:
-            self.bar.config(value=self._value())
-            self.caption.config(text=caption)
-            self.root.update()
-        except Exception:
-            self.ok = False
+        widgets["activity"].config(text=status.activity)
 
-    def _label_caption(self, phase: str) -> None:
-        self._refresh(f"Label {self.cur + 1}/{self.n_labels} — {phase} — "
-                      f"elapsed {self._fmt(time.time() - self.start)} — finish {self._finish()}")
+        bar = widgets["bar"]
+        if status.activity_total > 0:
+            if widgets["bar_mode"] != "determinate":
+                bar.stop()
+                bar.config(mode="determinate")
+                widgets["bar_mode"] = "determinate"
+            bar.config(value=self._BAR_STEPS * status.activity_done / status.activity_total)
+        elif widgets["bar_mode"] != "indeterminate":
+            bar.config(mode="indeterminate", value=0)
+            bar.start(20)
+            widgets["bar_mode"] = "indeterminate"
 
-    def phase(self, text: str) -> None:
-        """A one-off setup stage before per-label work (e.g. reading, inventorying)."""
-        self._refresh(f"{text} — elapsed {self._fmt(time.time() - self.start)}")
-
-    def start_labels(self, n_labels: int) -> None:
-        self.n_labels = max(1, n_labels)
-
-    def preparing(self, idx: int) -> None:
-        """Called before the (blocking) prep result is awaited, so the caption shows why."""
-        self.cur = idx
-        self.cur_tick = 0
-        self.cur_ticks = 1
-        self.every = 1
-        self.label_start = None
-        self.n_comps_cur = 0
-        self.comps_done = 0
-        self.mesh_elapsed_cur = 0.0
-        self.mesh_start = None
-        self._label_caption("preparing (smoothing mask)…")
-
-    def begin_label(self, idx: int, ticks: int, n_comps: int = 0) -> None:
-        self.cur = idx
-        self.cur_tick = 0
-        self.cur_ticks = max(1, ticks)
-        self.every = max(1, self.cur_ticks // 50)   # repaint at most ~50 times per label
-        self.label_start = None
-        self.n_comps_cur = n_comps
-        self.comps_done = 0
-        self.mesh_elapsed_cur = 0.0
-        self.mesh_start = None
-        self._label_caption("uploading")
-
-    def band(self) -> None:
-        """Advance one upload tick; repaint the GUI only (throttled), never logs."""
-        if self.label_start is None:
-            self.label_start = time.time()          # first band = upload start (for ETA)
-        self.cur_tick += 1
-        if self.cur_tick % self.every == 0 or self.cur_tick >= self.cur_ticks:
-            self._label_caption("uploading")
-
-    def detecting(self, comp_idx: int | None = None, n_comps: int | None = None) -> None:
-        """
-        Caption only; the bar stays wherever the upload ticks left it.  cur_tick isn't
-        touched here, since more component uploads may still follow in this label — the
-        bar only reads "label complete" once end_label() is called.
-        """
-        self.mesh_start = time.time()
-        if comp_idx is not None and n_comps and n_comps > 1:
-            self._label_caption(f"meshing surface {comp_idx + 1}/{n_comps} "
-                                f"(Imaris working)…")
+        elapsed_text = f"Elapsed {_format_duration(now - widgets['start'])}"
+        if status.stage == "build":
+            remaining = _estimate_remaining(now - status.stage_start, *status.build_fractions())
+            if remaining is None:
+                finish_text = "estimating finish time…"
+            else:
+                finish_clock = datetime.datetime.fromtimestamp(now + remaining)
+                finish_text = f"estimated finish around {finish_clock.strftime('%H:%M')}"
         else:
-            self._label_caption("meshing surface (Imaris working)…")
+            finish_text = "finish time is estimated once surfaces start building"
+        widgets["timing"].config(text=f"{elapsed_text}   ·   {finish_text}")
 
-    def meshed(self, seconds: float) -> None:
-        """One AddSurface finished; feed its measured duration into the ETA."""
-        self.mesh_times.append(seconds)
-        self.mesh_elapsed_cur += seconds
-        self.comps_done += 1
-        self.mesh_start = None
+    # ---- Summary page ---------------------------------------------------
 
-    def end_label(self, duration: float) -> None:
-        self.times.append(duration)
-        self.cur_tick = self.cur_ticks
-        self._label_caption("done")
+    def _show_summary(self, summary: _Summary) -> None:
+        tk = self._tk
+        self._status = None
+        self._progress = None
+        page = self._set_page(close_action=self._root.quit, topmost=False)
+        wrap = self._WIDTH - 40
 
-    def close(self) -> None:
-        if self.ok:
-            try:
-                self.root.destroy()
-            except Exception:
-                pass
-            self.ok = False
+        tk.Label(page, text=summary.headline, font=("", 11, "bold"),
+                 anchor="w").pack(fill="x")
+        for line in summary.details:
+            tk.Label(page, text=line, anchor="w", justify="left",
+                     wraplength=wrap).pack(fill="x", pady=(6, 0))
+
+        if summary.warnings:
+            tk.Label(page, text="Warnings", font=("", 10, "bold"),
+                     anchor="w").pack(fill="x", pady=(12, 0))
+            for warning in summary.warnings:
+                tk.Label(page, text=f"• {warning}", anchor="w", justify="left",
+                         wraplength=wrap).pack(fill="x", pady=(2, 0))
+
+        if summary.log_path:
+            tk.Label(page, text=f"Log: {summary.log_path}", anchor="w", justify="left",
+                     wraplength=wrap, fg="grey").pack(fill="x", pady=(12, 0))
+
+        buttons = tk.Frame(page)
+        buttons.pack(pady=(12, 0))
+        if summary.log_path and sys.platform == "win32":
+            tk.Button(buttons, text="Open log", width=12,
+                      command=lambda: os.startfile(summary.log_path)).pack(side="left", padx=6)
+        tk.Button(buttons, text="Close", width=12,
+                  command=self._root.quit).pack(side="left", padx=6)
+        self._fit()
 
 
 # -----------------------------------------------------------------------
